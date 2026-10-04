@@ -136,7 +136,7 @@ less; a 32-bit sample keeps its top 24 bits.
 
 On a Ryzen 9 9950X (Windows, a shared machine, best of five), in multiples
 of real time, for the first 60 s of a 16-bit and a 24-bit stereo 44.1 kHz
-album track; `cargo run --release --example bench -- <file.flac>` measures
+album track; `cargo run --release --example lossless_bench -- <file.flac>` measures
 it on any FLAC file. Encoders on one thread, then on all of them.
 
 | | 16-bit before | 16-bit now | 24-bit before | 24-bit now |

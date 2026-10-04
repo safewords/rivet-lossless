@@ -1,5 +1,5 @@
 //! Throughput of the four codecs on a native FLAC file:
-//! `cargo run --release --example bench -- <file.flac> [seconds] [runs]`.
+//! `cargo run --release --example lossless_bench -- <file.flac> [seconds] [runs]`.
 //!
 //! The file is decoded (its MD5 checked), then its first `seconds` (default
 //! 60) are encoded as FLAC at every level and as ALAC, and those streams

@@ -15,7 +15,8 @@
 //! BR SL SR; see [`layout`](super::layout)), so the channels pass through
 //! in place.
 
-use super::format::{StreamInfo, crc8, crc16, md5_bytes, stream_info_from_extra};
+use super::format::{StreamInfo, crc8, crc16, stream_info_from_extra};
+use super::verify::Md5Verifier;
 use crate::Error;
 use crate::bits::BitReader;
 
@@ -396,9 +397,9 @@ fn restore_lpc_any(s: &mut [i64], coefs: &[i64], shift: u32) {
 /// integer samples out, with the STREAMINFO MD5 checked along the way.
 pub struct Decoder {
     info: Option<StreamInfo>,
-    /// Running MD5 of the decoded audio, when STREAMINFO has one to check.
-    md5: Option<crate::md5::Md5>,
-    md5_scratch: Vec<u8>,
+    /// Running MD5 of the decoded audio, when STREAMINFO has one to check:
+    /// hashed on a helper thread, overlapping the decode (see `verify`).
+    md5: Option<Md5Verifier>,
     samples_decoded: u64,
     /// Bit depth and rate of the last frame.
     bits: u32,
@@ -417,14 +418,13 @@ impl Decoder {
             Some(e) if !e.is_empty() => Some(stream_info_from_extra(e)?),
             _ => None,
         };
-        let md5 = info.as_ref().filter(|i| i.md5 != [0; 16]).map(|_| crate::md5::Md5::new());
+        let md5 = info.as_ref().filter(|i| i.md5 != [0; 16]).map(|_| Md5Verifier::new());
         Ok(Self {
             bits: info.as_ref().map_or(16, |i| u32::from(i.bits_per_sample)),
             sample_rate: info.as_ref().map_or(sample_rate, |i| i.sample_rate),
             channels: info.as_ref().map_or(channels, |i| i.channels),
             info,
             md5,
-            md5_scratch: Vec::new(),
             samples_decoded: 0,
         })
     }
@@ -471,13 +471,12 @@ impl Decoder {
             self.channels = h.channels;
             self.bits = h.bits_per_sample;
             self.sample_rate = h.sample_rate;
-            if let Some(ctx) = self.md5.as_mut() {
-                self.md5_scratch.clear();
-                md5_bytes(&frame.samples, h.bits_per_sample, &mut self.md5_scratch);
-                ctx.consume(&self.md5_scratch);
-            }
             self.samples_decoded += u64::from(h.block_size);
             out.extend_from_slice(&frame.samples);
+            if let Some(md5) = self.md5.as_mut() {
+                // The frame's own buffer goes to the hash thread: no copy.
+                md5.push(frame.samples, h.bits_per_sample);
+            }
         }
         if at == 0 && !packet.is_empty() {
             return Err(err("packet does not start with a frame"));
@@ -494,7 +493,7 @@ impl Decoder {
         if info.total_samples == 0 || info.total_samples != self.samples_decoded {
             return None;
         }
-        Some(ctx.compute() == info.md5)
+        Some(ctx.digest() == info.md5)
     }
 }
 

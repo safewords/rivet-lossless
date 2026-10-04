@@ -169,3 +169,31 @@ fn the_encoded_bytes_do_not_change() {
     ];
     assert_eq!(got, want, "{got:#018x?}");
 }
+
+#[test]
+fn a_wrong_md5_is_caught_with_the_hash_off_the_decoding_thread() {
+    let pcm = signal(30_000, 2, 24, 11);
+    let mut enc = Encoder::new(EncoderConfig { sample_rate: 44_100, channels: 2, bits_per_sample: 24, level: Level::Fast })
+        .unwrap();
+    let mut frames = enc.encode_int(&pcm);
+    frames.extend(enc.finish());
+    let md5 = enc.stream_info().md5;
+    let head = enc.metadata_blocks();
+    let at = head.windows(16).position(|w| w == md5).expect("the MD5 in STREAMINFO");
+    for (wrong, expect) in [(false, true), (true, false)] {
+        let mut extra = head.clone();
+        if wrong {
+            extra[at + 15] ^= 1;
+        }
+        let mut dec = Decoder::new(Some(&extra), 44_100, 2).unwrap();
+        for (i, (f, _)) in frames.iter().enumerate() {
+            dec.decode_int(f).unwrap();
+            if i + 1 < frames.len() {
+                assert_eq!(dec.md5_matches(), None, "not at the end yet");
+            }
+        }
+        assert_eq!(dec.md5_matches(), Some(expect), "MD5 altered: {wrong}");
+        // Asking again gives the same answer.
+        assert_eq!(dec.md5_matches(), Some(expect));
+    }
+}

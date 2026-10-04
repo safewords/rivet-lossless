@@ -170,9 +170,13 @@ tested. The `force-scalar` feature compiles the run-time selection out
 completes on scoped threads, one per CPU by default
 (`Encoder::set_threads(1)` keeps everything on the caller's thread); the
 stream is the same byte for byte whatever the count. A caller feeding one
-frame's worth at a time gets no threading. The decoders are
-single-threaded: the MD5 check is one serial hash over the stream, and a
-third of a 24-bit decode.
+frame's worth at a time gets no threading. The decoders decode on the
+caller's thread; the FLAC decoder's MD5 check — one serial hash over the
+stream, a third of a 24-bit decode — runs beside it on one helper thread,
+fed each decoded frame in order, and `md5_matches` waits for it to catch
+up, so the answer is the same as hashing inline (`src/flac/verify.rs`).
+That took the decode of a 180 s 96 kHz 24-bit stereo file from 785× to
+1265× real time, and of the same at 44.1 kHz 16-bit from 2066× to 3308×.
 
 ## How it is checked
 

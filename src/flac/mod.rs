@@ -15,6 +15,7 @@
 mod decode;
 mod encode;
 mod format;
+mod verify;
 
 pub use decode::{DecodedFrame, Decoder, FrameHeader, decode_frame, parse_frame_header};
 pub use encode::{BLOCK_SIZE, Encoder, EncoderConfig, Level};

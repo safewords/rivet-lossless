@@ -39,8 +39,14 @@ enum Mode {
     /// Nothing hashed yet. The thread starts with the first frame, so a
     /// decoder that never decodes starts none.
     Idle,
-    Thread { tx: SyncSender<Msg>, abandoned: Arc<AtomicBool> },
-    Inline { ctx: Md5, scratch: Vec<u8> },
+    Thread {
+        tx: SyncSender<Msg>,
+        abandoned: Arc<AtomicBool>,
+    },
+    Inline {
+        ctx: Md5,
+        scratch: Vec<u8>,
+    },
 }
 
 impl Md5Verifier {
@@ -51,20 +57,29 @@ impl Md5Verifier {
     /// The same as [`Self::new`], hashing on the calling thread.
     #[cfg(test)]
     pub(super) fn inline() -> Self {
-        Self { mode: Mode::Inline { ctx: Md5::new(), scratch: Vec::new() } }
+        Self {
+            mode: Mode::Inline {
+                ctx: Md5::new(),
+                scratch: Vec::new(),
+            },
+        }
     }
 
     /// Hash `samples` (interleaved, `bits` per sample) after every frame
     /// pushed before.
     pub(super) fn push(&mut self, samples: Vec<i32>, bits: u32) {
         if let Mode::Idle = self.mode {
-            self.mode = spawn().unwrap_or(Mode::Inline { ctx: Md5::new(), scratch: Vec::new() });
+            self.mode = spawn().unwrap_or(Mode::Inline {
+                ctx: Md5::new(),
+                scratch: Vec::new(),
+            });
         }
         match &mut self.mode {
             Mode::Thread { tx, .. } => {
                 // The thread only returns once every sender is gone, and
                 // this one is still here.
-                tx.send(Msg::Frame(samples, bits)).expect("the FLAC MD5 thread stopped");
+                tx.send(Msg::Frame(samples, bits))
+                    .expect("the FLAC MD5 thread stopped");
             }
             Mode::Inline { ctx, scratch } => {
                 scratch.clear();
@@ -82,7 +97,8 @@ impl Md5Verifier {
             Mode::Inline { ctx, .. } => ctx.compute(),
             Mode::Thread { tx, .. } => {
                 let (reply, answer) = sync_channel(1);
-                tx.send(Msg::Digest(reply)).expect("the FLAC MD5 thread stopped");
+                tx.send(Msg::Digest(reply))
+                    .expect("the FLAC MD5 thread stopped");
                 answer.recv().expect("the FLAC MD5 thread stopped")
             }
         }
@@ -103,7 +119,10 @@ fn spawn() -> Option<Mode> {
     let (tx, rx) = sync_channel(QUEUE);
     let abandoned = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&abandoned);
-    std::thread::Builder::new().name("flac-md5".into()).spawn(move || run(&rx, &flag)).ok()?;
+    std::thread::Builder::new()
+        .name("flac-md5".into())
+        .spawn(move || run(&rx, &flag))
+        .ok()?;
     Some(Mode::Thread { tx, abandoned })
 }
 
@@ -162,7 +181,10 @@ mod tests {
             }
         }
         assert_eq!(threaded.digest(), inline.digest());
-        assert!(matches!(threaded.mode, Mode::Thread { .. }), "the hash ran on its thread");
+        assert!(
+            matches!(threaded.mode, Mode::Thread { .. }),
+            "the hash ran on its thread"
+        );
     }
 
     #[test]
@@ -172,7 +194,10 @@ mod tests {
         v.push(vec![i32::from(b'a'), i32::from(b'b'), i32::from(b'c')], 8);
         assert_eq!(
             v.digest(),
-            [0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72]
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, 0x72
+            ]
         );
     }
 

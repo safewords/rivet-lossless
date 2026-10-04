@@ -98,13 +98,22 @@ impl Encoder {
     /// channels, 4–32 bits or a sample rate of 1 Hz to 2^20 - 1 Hz.
     pub fn new(config: EncoderConfig) -> Result<Self, Error> {
         if !(1..=8).contains(&config.channels) {
-            return Err(Error::Unsupported(format!("flac: {} channels (1–8)", config.channels)));
+            return Err(Error::Unsupported(format!(
+                "flac: {} channels (1–8)",
+                config.channels
+            )));
         }
         if !(4..=32).contains(&config.bits_per_sample) {
-            return Err(Error::Unsupported(format!("flac: {}-bit samples (4–32)", config.bits_per_sample)));
+            return Err(Error::Unsupported(format!(
+                "flac: {}-bit samples (4–32)",
+                config.bits_per_sample
+            )));
         }
         if config.sample_rate == 0 || config.sample_rate >= 1 << 20 {
-            return Err(Error::Unsupported(format!("flac: sample rate {} Hz", config.sample_rate)));
+            return Err(Error::Unsupported(format!(
+                "flac: sample rate {} Hz",
+                config.sample_rate
+            )));
         }
         Ok(Self {
             config,
@@ -118,7 +127,11 @@ impl Encoder {
             md5_scratch: Vec::new(),
             md5_digest: None,
             threads: 0,
-            window: if config.level.max_lpc_order() > 0 { lpc::tukey(BLOCK_SIZE, 0.5) } else { Vec::new() },
+            window: if config.level.max_lpc_order() > 0 {
+                lpc::tukey(BLOCK_SIZE, 0.5)
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -148,10 +161,20 @@ impl Encoder {
             md5_bytes(block, bps, &mut self.md5_scratch);
             self.md5.consume(&self.md5_scratch);
         }
-        let threads = if self.threads == 0 { crate::parallel::auto_threads() } else { self.threads };
-        let (config, first, window, pending) = (&self.config, self.frames, &self.window, &self.pending);
+        let threads = if self.threads == 0 {
+            crate::parallel::auto_threads()
+        } else {
+            self.threads
+        };
+        let (config, first, window, pending) =
+            (&self.config, self.frames, &self.window, &self.pending);
         let frames = crate::parallel::map(whole, threads, |i| {
-            encode_frame(config, first + i as u64, &pending[i * len..(i + 1) * len], window)
+            encode_frame(
+                config,
+                first + i as u64,
+                &pending[i * len..(i + 1) * len],
+                window,
+            )
         });
         self.pending.drain(..whole * len);
         frames
@@ -179,11 +202,19 @@ impl Encoder {
 
     /// The stream's STREAMINFO as it stands (complete after [`finish`](Self::finish)).
     pub fn stream_info(&self) -> StreamInfo {
-        let block = if self.frames <= 1 { self.last_block.max(16) } else { BLOCK_SIZE } as u16;
+        let block = if self.frames <= 1 {
+            self.last_block.max(16)
+        } else {
+            BLOCK_SIZE
+        } as u16;
         StreamInfo {
             min_block_size: block,
             max_block_size: block,
-            min_frame_size: if self.max_frame == 0 { 0 } else { self.min_frame },
+            min_frame_size: if self.max_frame == 0 {
+                0
+            } else {
+                self.min_frame
+            },
             max_frame_size: self.max_frame,
             sample_rate: self.config.sample_rate,
             channels: self.config.channels,
@@ -224,12 +255,25 @@ impl Encoder {
 
 /// Code one block as frame number `frame`. `window` is the analysis window
 /// of a whole block (`BLOCK_SIZE`), used when the block is one.
-fn encode_frame(config: &EncoderConfig, frame: u64, interleaved: &[i32], window: &[f64]) -> Vec<u8> {
+fn encode_frame(
+    config: &EncoderConfig,
+    frame: u64,
+    interleaved: &[i32],
+    window: &[f64],
+) -> Vec<u8> {
     let ch = usize::from(config.channels);
     let n = interleaved.len() / ch;
     let bps = u32::from(config.bits_per_sample);
-    let chans: Vec<Vec<i64>> =
-        (0..ch).map(|c| interleaved.iter().skip(c).step_by(ch).map(|&s| i64::from(s)).collect()).collect();
+    let chans: Vec<Vec<i64>> = (0..ch)
+        .map(|c| {
+            interleaved
+                .iter()
+                .skip(c)
+                .step_by(ch)
+                .map(|&s| i64::from(s))
+                .collect()
+        })
+        .collect();
     let level = config.level;
     let own;
     let window = if level.max_lpc_order() == 0 || n < 2 {
@@ -248,8 +292,12 @@ fn encode_frame(config: &EncoderConfig, frame: u64, interleaved: &[i32], window:
         let pr = plan_subframe(r, bps, level, window);
         let pm = plan_subframe(&mid, bps, level, window);
         let ps = plan_subframe(&side, bps + 1, level, window);
-        let options =
-            [(1u8, pl.bits + pr.bits), (8, pl.bits + ps.bits), (9, ps.bits + pr.bits), (10, pm.bits + ps.bits)];
+        let options = [
+            (1u8, pl.bits + pr.bits),
+            (8, pl.bits + ps.bits),
+            (9, ps.bits + pr.bits),
+            (10, pm.bits + ps.bits),
+        ];
         let best = options.iter().min_by_key(|o| o.1).expect("four options").0;
         let pair = match best {
             1 => vec![pl, pr],
@@ -259,7 +307,13 @@ fn encode_frame(config: &EncoderConfig, frame: u64, interleaved: &[i32], window:
         };
         (best, pair)
     } else {
-        ((ch - 1) as u8, chans.iter().map(|c| plan_subframe(c, bps, level, window)).collect())
+        (
+            (ch - 1) as u8,
+            chans
+                .iter()
+                .map(|c| plan_subframe(c, bps, level, window))
+                .collect(),
+        )
     };
 
     let mut bw = BitWriter::with_capacity(n * ch * bps as usize / 8 + 64);
@@ -274,13 +328,22 @@ fn encode_frame(config: &EncoderConfig, frame: u64, interleaved: &[i32], window:
 }
 
 /// The frame header (§9.1) of a fixed-block-size stream, CRC-8 included.
-fn write_frame_header(bw: &mut BitWriter, frame: u64, n: usize, rate: u32, assignment: u8, bps: u32) {
+fn write_frame_header(
+    bw: &mut BitWriter,
+    frame: u64,
+    n: usize,
+    rate: u32,
+    assignment: u8,
+    bps: u32,
+) {
     let start = bw.len_bits();
     debug_assert_eq!(start % 8, 0);
     let (bs_code, bs_extra) = match n {
         192 => (1, None),
         576 | 1152 | 2304 | 4608 => (2 + (n / 576).trailing_zeros(), None),
-        256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => (8 + (n / 256).trailing_zeros(), None),
+        256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => {
+            (8 + (n / 256).trailing_zeros(), None)
+        }
         n if n <= 256 => (6, Some(((n - 1) as u64, 8))),
         n => (7, Some(((n - 1) as u64, 16))),
     };
@@ -365,7 +428,11 @@ enum SubKind {
     Constant,
     Verbatim,
     Fixed(usize),
-    Lpc { coefs: Vec<i32>, precision: u32, shift: i32 },
+    Lpc {
+        coefs: Vec<i32>,
+        precision: u32,
+        shift: i32,
+    },
 }
 
 impl SubKind {
@@ -416,7 +483,11 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level, window: &[f64]) -> SubframeP
     }
     let or = x.iter().fold(0i64, |a, &v| a | v);
     let wasted = (or.trailing_zeros()).min(bps - 1);
-    let samples: Vec<i64> = if wasted > 0 { x.iter().map(|&v| v >> wasted).collect() } else { x.to_vec() };
+    let samples: Vec<i64> = if wasted > 0 {
+        x.iter().map(|&v| v >> wasted).collect()
+    } else {
+        x.to_vec()
+    };
     let ebps = bps - wasted;
     // Header: padding bit, type, wasted flag, and the wasted count in unary.
     let header = 8 + wasted as usize;
@@ -445,12 +516,24 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level, window: &[f64]) -> SubframeP
         }
         if let Some((_, order)) = pick {
             fixed_residual(&best.samples, order, &mut scratch.residual);
-            consider(&mut best, SubKind::Fixed(order), &mut scratch, header + order * ebps as usize, level);
+            consider(
+                &mut best,
+                SubKind::Fixed(order),
+                &mut scratch,
+                header + order * ebps as usize,
+                level,
+            );
         }
     } else {
         for order in orders {
             fixed_residual(&best.samples, order, &mut scratch.residual);
-            consider(&mut best, SubKind::Fixed(order), &mut scratch, header + order * ebps as usize, level);
+            consider(
+                &mut best,
+                SubKind::Fixed(order),
+                &mut scratch,
+                header + order * ebps as usize,
+                level,
+            );
         }
     }
 
@@ -469,17 +552,40 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level, window: &[f64]) -> SubframeP
                 let e = (errors[k - 1] / n as f64).max(1e-9);
                 n as f64 * (0.5 * e.log2()).max(0.0) + (k as f64) * f64::from(precision + ebps)
             };
-            (1..=coefs.len()).min_by(|&a, &b| est(a).total_cmp(&est(b))).into_iter().collect()
+            (1..=coefs.len())
+                .min_by(|&a, &b| est(a).total_cmp(&est(b)))
+                .into_iter()
+                .collect()
         };
         // The samples as i32 when they all fit, for the vector residual.
-        let narrow: Option<Vec<i32>> = best.samples.iter().map(|&v| i32::try_from(v).ok()).collect();
+        let narrow: Option<Vec<i32>> = best
+            .samples
+            .iter()
+            .map(|&v| i32::try_from(v).ok())
+            .collect();
         for order in orders {
             let (q, shift) = lpc::quantize(&coefs[order - 1], precision, 15);
-            if !lpc_residual(&best.samples, narrow.as_deref(), &q, shift, &mut scratch.residual) {
+            if !lpc_residual(
+                &best.samples,
+                narrow.as_deref(),
+                &q,
+                shift,
+                &mut scratch.residual,
+            ) {
                 continue;
             }
             let head = header + order * ebps as usize + 4 + 5 + order * precision as usize;
-            consider(&mut best, SubKind::Lpc { coefs: q, precision, shift }, &mut scratch, head, level);
+            consider(
+                &mut best,
+                SubKind::Lpc {
+                    coefs: q,
+                    precision,
+                    shift,
+                },
+                &mut scratch,
+                head,
+                level,
+            );
         }
     }
     best
@@ -487,14 +593,25 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level, window: &[f64]) -> SubframeP
 
 /// Replace `best` with the predicted form when its residual (in
 /// `scratch.residual`) codes smaller.
-fn consider(best: &mut SubframePlan, kind: SubKind, scratch: &mut Scratch, head_bits: usize, level: Level) {
+fn consider(
+    best: &mut SubframePlan,
+    kind: SubKind,
+    scratch: &mut Scratch,
+    head_bits: usize,
+    level: Level,
+) {
     // Residuals a decoder cannot hold in 32 bits are not an option; the
     // rest fold into 31 bits.
     if !fold(&scratch.residual, &mut scratch.folded) {
         return;
     }
     let n = best.samples.len();
-    let rice = plan_rice(&scratch.folded, n, kind.order(), level.max_partition_order());
+    let rice = plan_rice(
+        &scratch.folded,
+        n,
+        kind.order(),
+        level.max_partition_order(),
+    );
     let bits = head_bits + rice.bits;
     if bits < best.bits {
         best.kind = kind;
@@ -517,7 +634,10 @@ fn fixed_residual(x: &[i64], order: usize, out: &mut Vec<i64>) {
         1 => out.extend(x.windows(2).map(|w| w[1] - w[0])),
         2 => out.extend(x.windows(3).map(|w| w[2] - 2 * w[1] + w[0])),
         3 => out.extend(x.windows(4).map(|w| w[3] - 3 * w[2] + 3 * w[1] - w[0])),
-        _ => out.extend(x.windows(5).map(|w| w[4] - 4 * w[3] + 6 * w[2] - 4 * w[1] + w[0])),
+        _ => out.extend(
+            x.windows(5)
+                .map(|w| w[4] - 4 * w[3] + 6 * w[2] - 4 * w[1] + w[0]),
+        ),
     }
 }
 
@@ -526,7 +646,13 @@ fn fixed_residual(x: &[i64], order: usize, out: &mut Vec<i64>) {
 /// i32 when it fits, which takes the vector kernel: 15-bit coefficients
 /// times 32-bit samples, 32 of them, stay well inside 64 bits, so its
 /// result is the checked loop's.
-fn lpc_residual(x: &[i64], narrow: Option<&[i32]>, coefs: &[i32], shift: i32, out: &mut Vec<i64>) -> bool {
+fn lpc_residual(
+    x: &[i64],
+    narrow: Option<&[i32]>,
+    coefs: &[i32],
+    shift: i32,
+    out: &mut Vec<i64>,
+) -> bool {
     let order = coefs.len();
     out.clear();
     if x.len() <= order {
@@ -543,7 +669,10 @@ fn lpc_residual(x: &[i64], narrow: Option<&[i32]>, coefs: &[i32], shift: i32, ou
     for i in order..x.len() {
         let mut acc: i64 = 0;
         for (j, &c) in coefs.iter().enumerate() {
-            let Some(next) = i64::from(c).checked_mul(x[i - 1 - j]).and_then(|p| acc.checked_add(p)) else {
+            let Some(next) = i64::from(c)
+                .checked_mul(x[i - 1 - j])
+                .and_then(|p| acc.checked_add(p))
+            else {
                 return false;
             };
             acc = next;
@@ -660,7 +789,10 @@ fn plan_rice(u: &[u32], n: usize, order: usize, max_order: u32) -> RicePlan {
             best = Some((level, bits));
         }
         for i in 0..merged.len() / 2 {
-            merged[i] = (merged[2 * i].0 + merged[2 * i + 1].0, merged[2 * i].1 + merged[2 * i + 1].1);
+            merged[i] = (
+                merged[2 * i].0 + merged[2 * i + 1].0,
+                merged[2 * i].1 + merged[2 * i + 1].1,
+            );
         }
         merged.truncate(merged.len() / 2);
     }
@@ -671,13 +803,21 @@ fn plan_rice(u: &[u32], n: usize, order: usize, max_order: u32) -> RicePlan {
     let mut ors = Vec::with_capacity(1 << level);
     let mut wide = false;
     for g in finest.chunks(group) {
-        let (sum, count) = g.iter().fold((0u64, 0usize), |(s, c), p| (s + p.sum, c + p.count));
+        let (sum, count) = g
+            .iter()
+            .fold((0u64, 0usize), |(s, c), p| (s + p.sum, c + p.count));
         let k = best_k(sum, count);
         wide |= k > 14;
         params.push(Ok(k));
         ors.push(g.iter().fold(0, |o, p| o | p.or));
     }
-    let mut plan = RicePlan { order: level, params, wide, bits, ors };
+    let mut plan = RicePlan {
+        order: level,
+        params,
+        wide,
+        bits,
+        ors,
+    };
     exact_rice(&mut plan, u, n, order);
     plan
 }
@@ -688,7 +828,11 @@ fn best_k(sum: u64, count: usize) -> u32 {
         return 0;
     }
     let mean = sum / count as u64;
-    let guess = if mean == 0 { 0 } else { 63 - mean.leading_zeros() };
+    let guess = if mean == 0 {
+        0
+    } else {
+        63 - mean.leading_zeros()
+    };
     let cost = |k: u32| count as u64 * u64::from(k + 1) + (sum >> k);
     let mut k = guess.min(30);
     while k > 0 && cost(k - 1) <= cost(k) {
@@ -717,7 +861,11 @@ fn exact_rice(plan: &mut RicePlan, u: &[u32], n: usize, order: usize) {
         // halved) plus a sign bit, and 0 takes none: the widest follows
         // from the OR of the partition's folded values.
         let or = plan.ors[p];
-        let width = if or == 0 { 0 } else { 33 - (or >> 1).leading_zeros() };
+        let width = if or == 0 {
+            0
+        } else {
+            33 - (or >> 1).leading_zeros()
+        };
         let escape = 5 + count * width as usize;
         let escape_code = if plan.wide { 31 } else { 15 };
         if escape < rice && width <= 31 || k >= escape_code {
@@ -763,7 +911,11 @@ fn write_subframe(bw: &mut BitWriter, s: &SubframePlan) {
             }
             write_residual(bw, s);
         }
-        SubKind::Lpc { coefs, precision, shift } => {
+        SubKind::Lpc {
+            coefs,
+            precision,
+            shift,
+        } => {
             for &v in &s.samples[..coefs.len()] {
                 bw.write_signed(v, s.bps);
             }
@@ -778,7 +930,10 @@ fn write_subframe(bw: &mut BitWriter, s: &SubframePlan) {
 }
 
 fn write_residual(bw: &mut BitWriter, s: &SubframePlan) {
-    let rice = s.rice.as_ref().expect("a predicted subframe has a Rice plan");
+    let rice = s
+        .rice
+        .as_ref()
+        .expect("a predicted subframe has a Rice plan");
     let (param_bits, escape) = if rice.wide { (5, 31) } else { (4, 15) };
     bw.write(u64::from(rice.wide), 2);
     bw.write(u64::from(rice.order), 4);

@@ -111,9 +111,9 @@ impl Config {
         } else if let Some(i) = extra.windows(4).position(|w| w == b"alac") {
             // `alac` atom: 4-byte size before the type, 4 bytes of
             // version/flags after it.
-            extra
-                .get(i + 8..i + 8 + Self::LEN)
-                .ok_or_else(|| Error::Invalid("alac: magic cookie truncated after its atom header".into()))?
+            extra.get(i + 8..i + 8 + Self::LEN).ok_or_else(|| {
+                Error::Invalid("alac: magic cookie truncated after its atom header".into())
+            })?
         } else {
             return Err(Error::Invalid(format!(
                 "alac: {}-byte codec configuration is not an ALACSpecificConfig",
@@ -135,16 +135,28 @@ impl Config {
             sample_rate: be32(20),
         };
         if c.compatible_version != 0 {
-            return Err(Error::Unsupported(format!("alac: magic cookie compatible version {}", c.compatible_version)));
+            return Err(Error::Unsupported(format!(
+                "alac: magic cookie compatible version {}",
+                c.compatible_version
+            )));
         }
         if !matches!(c.bit_depth, 16 | 20 | 24 | 32) {
-            return Err(Error::Unsupported(format!("alac: bit depth {}", c.bit_depth)));
+            return Err(Error::Unsupported(format!(
+                "alac: bit depth {}",
+                c.bit_depth
+            )));
         }
         if !(1..=8).contains(&c.num_channels) {
-            return Err(Error::Unsupported(format!("alac: {} channels", c.num_channels)));
+            return Err(Error::Unsupported(format!(
+                "alac: {} channels",
+                c.num_channels
+            )));
         }
         if c.frame_length == 0 || c.frame_length > 1 << 16 {
-            return Err(Error::Invalid(format!("alac: frame length {}", c.frame_length)));
+            return Err(Error::Invalid(format!(
+                "alac: frame length {}",
+                c.frame_length
+            )));
         }
         if c.kb == 0 || c.kb > 31 {
             return Err(Error::Invalid(format!("alac: Rice limit {}", c.kb)));
@@ -221,7 +233,11 @@ pub struct RiceParams {
 
 impl RiceParams {
     pub fn new(config: &Config, pb_factor: u32) -> Self {
-        Self { pb: u32::from(config.pb) * pb_factor / 4, mb: u32::from(config.mb), kb: u32::from(config.kb) }
+        Self {
+            pb: u32::from(config.pb) * pb_factor / 4,
+            mb: u32::from(config.mb),
+            kb: u32::from(config.kb),
+        }
     }
 }
 
@@ -290,7 +306,11 @@ pub(crate) fn decode_residuals(
         let coded = read_code(br, k, sample_bits)?;
         let v = coded.wrapping_add(sign_modifier);
         // Even values are the non-negative residuals, odd ones the negative.
-        out[i] = if v & 1 == 1 { -(((v >> 1) + 1) as i64) as i32 } else { (v >> 1) as i32 };
+        out[i] = if v & 1 == 1 {
+            -(((v >> 1) + 1) as i64) as i32
+        } else {
+            (v >> 1) as i32
+        };
         i += 1;
         // The history follows the value as decoded: after a run of zeros
         // that is one more than the value coded (`sign_modifier`), and
@@ -323,14 +343,23 @@ pub(crate) fn decode_residuals(
 }
 
 /// Encode `residuals` with the same adaptation [`decode_residuals`] follows.
-pub(crate) fn encode_residuals(bw: &mut BitWriter, p: &RiceParams, residuals: &[i32], sample_bits: u32) {
+pub(crate) fn encode_residuals(
+    bw: &mut BitWriter,
+    p: &RiceParams,
+    residuals: &[i32],
+    sample_bits: u32,
+) {
     let n = residuals.len();
     let mut history = p.mb;
     let mut sign_modifier = 0u32;
     let mut i = 0usize;
     while i < n {
         let r = residuals[i];
-        let v = if r < 0 { (-2 * i64::from(r) - 1) as u32 } else { (2 * i64::from(r)) as u32 };
+        let v = if r < 0 {
+            (-2 * i64::from(r) - 1) as u32
+        } else {
+            (2 * i64::from(r)) as u32
+        };
         let coded = v.wrapping_sub(sign_modifier);
         let k = sample_k(history, p.kb);
         write_code(bw, coded, k, sample_bits);
@@ -383,7 +412,11 @@ pub(crate) fn residual_bits(p: &RiceParams, residuals: &[i32], sample_bits: u32)
     let mut i = 0usize;
     while i < n {
         let r = residuals[i];
-        let v = if r < 0 { (-2 * i64::from(r) - 1) as u32 } else { (2 * i64::from(r)) as u32 };
+        let v = if r < 0 {
+            (-2 * i64::from(r) - 1) as u32
+        } else {
+            (2 * i64::from(r)) as u32
+        };
         let coded = v.wrapping_sub(sign_modifier);
         bits += code_bits(coded, sample_k(history, p.kb), sample_bits);
         i += 1;
@@ -437,7 +470,11 @@ impl Lms {
         if sum > i64::from(i32::MAX) || sum < i64::from(i32::MIN) {
             self.in_range = false;
         }
-        let rounding = if self.den_shift > 0 { 1i64 << (self.den_shift - 1) } else { 0 };
+        let rounding = if self.den_shift > 0 {
+            1i64 << (self.den_shift - 1)
+        } else {
+            0
+        };
         top + ((sum + rounding) >> self.den_shift)
     }
 
@@ -483,7 +520,11 @@ impl<const N: usize> LmsN<N> {
         if sum > i64::from(i32::MAX) || sum < i64::from(i32::MIN) {
             self.in_range = false;
         }
-        let rounding = if self.den_shift > 0 { 1i64 << (self.den_shift - 1) } else { 0 };
+        let rounding = if self.den_shift > 0 {
+            1i64 << (self.den_shift - 1)
+        } else {
+            0
+        };
         top + ((sum + rounding) >> self.den_shift)
     }
 
@@ -532,8 +573,11 @@ macro_rules! with_lms {
             8 => fixed!(8),
             16 => fixed!(16),
             _ => {
-                let mut $lms =
-                    Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift: $den_shift, in_range: true };
+                let mut $lms = Lms {
+                    coefs: coefs.iter().map(|&c| i64::from(c)).collect(),
+                    den_shift: $den_shift,
+                    in_range: true,
+                };
                 $body
             }
         }
@@ -612,7 +656,11 @@ mod tests {
 
     #[test]
     fn cookie_round_trips_in_every_wrapping() {
-        let c = Config { max_frame_bytes: 9000, avg_bit_rate: 800_000, ..Config::new(96_000, 6, 24) };
+        let c = Config {
+            max_frame_bytes: 9000,
+            avg_bit_rate: 800_000,
+            ..Config::new(96_000, 6, 24)
+        };
         let bare = c.to_bytes();
         assert_eq!(Config::parse(&bare).unwrap(), c);
         let mut fullbox = vec![0, 0, 0, 0];
@@ -655,8 +703,9 @@ mod tests {
 
     #[test]
     fn the_fixed_order_predictors_match_the_general_one() {
-        let x: Vec<i64> =
-            (0..3000).map(|i| ((i as f64 * 0.031).sin() * 9_000.0) as i64 + (i * 7919 % 61) as i64).collect();
+        let x: Vec<i64> = (0..3000)
+            .map(|i| ((i as f64 * 0.031).sin() * 9_000.0) as i64 + (i * 7919 % 61) as i64)
+            .collect();
         let mut seed = 3u32;
         for order in [4usize, 8, 16] {
             for _ in 0..5 {
@@ -669,8 +718,11 @@ mod tests {
                 // The general predictor, by way of a coefficient list
                 // whose order no fixed predictor takes.
                 let general = |data: &[i64]| -> (Vec<i64>, bool) {
-                    let mut lms =
-                        Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift: 9, in_range: true };
+                    let mut lms = Lms {
+                        coefs: coefs.iter().map(|&c| i64::from(c)).collect(),
+                        den_shift: 9,
+                        in_range: true,
+                    };
                     let mut res = data[..=order].to_vec();
                     for i in order + 1..data.len() {
                         let pred = lms.predict(data, i);
@@ -685,7 +737,10 @@ mod tests {
                     Some(got) => {
                         assert!(in_range);
                         assert_eq!(
-                            got.iter().skip(order + 1).map(|&r| i64::from(r)).collect::<Vec<_>>(),
+                            got.iter()
+                                .skip(order + 1)
+                                .map(|&r| i64::from(r))
+                                .collect::<Vec<_>>(),
                             want[order + 1..]
                         );
                         let mut back: Vec<i64> = got.iter().map(|&r| i64::from(r)).collect();
@@ -700,8 +755,14 @@ mod tests {
 
     #[test]
     fn the_predictor_inverts() {
-        let x: Vec<i64> = (0..4096).map(|i| ((i as f64 * 0.05).sin() * 20_000.0) as i64 + (i % 7) as i64).collect();
-        for (coefs, shift) in [(vec![], 9), (vec![1000i16, -500, 100, 20], 9), (vec![512; 8], 9)] {
+        let x: Vec<i64> = (0..4096)
+            .map(|i| ((i as f64 * 0.05).sin() * 20_000.0) as i64 + (i % 7) as i64)
+            .collect();
+        for (coefs, shift) in [
+            (vec![], 9),
+            (vec![1000i16, -500, 100, 20], 9),
+            (vec![512; 8], 9),
+        ] {
             let res = predict(&x, &coefs, shift, 17).expect("in range");
             let mut back: Vec<i64> = res.iter().map(|&r| i64::from(r)).collect();
             unpredict(&mut back, &coefs, coefs.len(), shift, 17);

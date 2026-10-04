@@ -33,7 +33,11 @@ fn round_trip(pcm: &[i32], channels: u8, bits: u8) -> usize {
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     let cookie = enc.cookie();
-    assert!(frames.iter().all(|(f, _)| f.len() as u32 <= cookie.max_frame_bytes));
+    assert!(
+        frames
+            .iter()
+            .all(|(f, _)| f.len() as u32 <= cookie.max_frame_bytes)
+    );
     let mut dec = Decoder::new(Some(&cookie.to_bytes())).unwrap();
     let mut got = Vec::new();
     let mut size = 0;
@@ -65,7 +69,11 @@ fn every_depth_and_layout_round_trips() {
 fn it_compresses_and_escapes_noise() {
     let pcm = signal(4096 * 4, 2, 16, 3);
     let size = round_trip(&pcm, 2, 16);
-    assert!(size < pcm.len() * 2 * 3 / 4, "{size} bytes for {} raw", pcm.len() * 2);
+    assert!(
+        size < pcm.len() * 2 * 3 / 4,
+        "{size} bytes for {} raw",
+        pcm.len() * 2
+    );
     // White noise at full scale does not compress: the frames escape, and
     // are barely larger than the samples.
     let mut rng = 12345u32;
@@ -108,7 +116,12 @@ fn the_encoded_bytes_do_not_change() {
     let mut got = Vec::new();
     for (channels, bits) in [(2u8, 16u8), (2, 24), (6, 20), (1, 32), (2, 32), (3, 16)] {
         let mut pcm = signal(30_000, usize::from(channels), u32::from(bits), 11);
-        for (i, s) in pcm.iter_mut().enumerate().skip(20_000 * usize::from(channels)).take(2_000) {
+        for (i, s) in pcm
+            .iter_mut()
+            .enumerate()
+            .skip(20_000 * usize::from(channels))
+            .take(2_000)
+        {
             *s = ((i as u32).wrapping_mul(2_654_435_761) as i32) >> (32 - u32::from(bits));
         }
         let h = stream_hash(&pcm, channels, bits, 1);

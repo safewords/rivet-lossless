@@ -18,8 +18,9 @@ mod format;
 pub use decode::{Decoder, decode_frame};
 pub use encode::Encoder;
 pub use format::{
-    Config, DEFAULT_FRAME_LENGTH, DEFAULT_KB, DEFAULT_MAX_RUN, DEFAULT_MB, DEFAULT_PB, ID_CCE, ID_CPE, ID_DSE, ID_END,
-    ID_FIL, ID_LFE, ID_PCE, ID_SCE, element_layout, native_from_alac, predict, unpredict,
+    Config, DEFAULT_FRAME_LENGTH, DEFAULT_KB, DEFAULT_MAX_RUN, DEFAULT_MB, DEFAULT_PB, ID_CCE,
+    ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE, element_layout, native_from_alac,
+    predict, unpredict,
 };
 
 use crate::Speaker;

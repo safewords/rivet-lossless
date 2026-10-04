@@ -17,7 +17,11 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8], codec: &'static str) -> Self {
-        Self { data, pos: 0, codec }
+        Self {
+            data,
+            pos: 0,
+            codec,
+        }
     }
 
     /// Bits consumed so far.
@@ -177,7 +181,8 @@ impl<'a> BitReader<'a> {
                     continue;
                 }
                 let byte = pos >> 3;
-                cache = u64::from_be_bytes(data[byte..byte + 8].try_into().expect("8 bytes")) << (pos & 7);
+                cache = u64::from_be_bytes(data[byte..byte + 8].try_into().expect("8 bytes"))
+                    << (pos & 7);
                 avail = 64 - (pos & 7) as u32;
                 z = cache.leading_zeros();
                 if z + 1 + k > avail {
@@ -262,7 +267,11 @@ pub(crate) struct BitWriter {
 
 impl BitWriter {
     pub fn with_capacity(bytes: usize) -> Self {
-        Self { bytes: Vec::with_capacity(bytes), acc: 0, live: 0 }
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            acc: 0,
+            live: 0,
+        }
     }
 
     /// Write the low `n` (≤ 64) bits of `v`.
@@ -283,7 +292,8 @@ impl BitWriter {
         if self.live >= 32 {
             // Four whole bytes at once.
             self.live -= 32;
-            self.bytes.extend_from_slice(&((self.acc >> self.live) as u32).to_be_bytes());
+            self.bytes
+                .extend_from_slice(&((self.acc >> self.live) as u32).to_be_bytes());
             self.acc &= (1u64 << self.live) - 1;
         }
     }
@@ -358,7 +368,9 @@ mod tests {
     #[test]
     fn round_trips_every_width() {
         let mut w = BitWriter::default();
-        let fields: Vec<(u64, u32)> = (1..=64).map(|n| (0xA5A5_5A5A_F00F_0FF0u64.rotate_left(n), n)).collect();
+        let fields: Vec<(u64, u32)> = (1..=64)
+            .map(|n| (0xA5A5_5A5A_F00F_0FF0u64.rotate_left(n), n))
+            .collect();
         for &(v, n) in &fields {
             w.write(v, n);
         }
@@ -398,8 +410,16 @@ mod tests {
             for i in 0..2000 {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 // Mostly small quotients, some long ones that need the slow path.
-                let q = if i % 97 == 0 { u64::from(seed >> 26) + 40 } else { u64::from(seed >> 29) };
-                let low = if k == 0 { 0 } else { u64::from(seed) & ((1u64 << k) - 1) };
+                let q = if i % 97 == 0 {
+                    u64::from(seed >> 26) + 40
+                } else {
+                    u64::from(seed >> 29)
+                };
+                let low = if k == 0 {
+                    0
+                } else {
+                    u64::from(seed) & ((1u64 << k) - 1)
+                };
                 let u = (q << k) | low;
                 w.write_unary_zeros(q as u32);
                 w.write(low, k);

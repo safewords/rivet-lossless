@@ -9,6 +9,7 @@
 //! hash's speed. No `unsafe`.
 
 /// `T[i] = floor(|sin(i + 1)| · 2^32)` (RFC 1321 §3.4).
+#[rustfmt::skip]
 const T: [u32; 64] = [
     0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8,
     0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
@@ -51,7 +52,9 @@ macro_rules! ff {
 }
 macro_rules! gg {
     ($a:ident, $b:ident, $c:ident, $d:ident, $mt:expr) => {
-        $a.wrapping_add($mt).wrapping_add($c & !$d).wrapping_add($b & $d)
+        $a.wrapping_add($mt)
+            .wrapping_add($c & !$d)
+            .wrapping_add($b & $d)
     };
 }
 macro_rules! hh {
@@ -147,7 +150,12 @@ fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
 
 impl Md5 {
     pub fn new() -> Self {
-        Self { state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], len: 0, buf: [0; 64], buffered: 0 }
+        Self {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+            len: 0,
+            buf: [0; 64],
+            buffered: 0,
+        }
     }
 
     pub fn consume(&mut self, mut data: &[u8]) {
@@ -177,7 +185,11 @@ impl Md5 {
         let mut h = self.clone();
         let bits = self.len.wrapping_mul(8);
         // A 1 bit, zeros to 56 mod 64 bytes, then the bit length (LE).
-        let pad = if self.buffered < 56 { 56 - self.buffered } else { 120 - self.buffered };
+        let pad = if self.buffered < 56 {
+            56 - self.buffered
+        } else {
+            120 - self.buffered
+        };
         let mut tail = [0u8; 72];
         tail[0] = 0x80;
         h.consume(&tail[..pad]);
@@ -202,6 +214,7 @@ mod tests {
     #[test]
     fn rfc_1321_test_suite() {
         // RFC 1321 appendix A.5.
+        #[rustfmt::skip]
         let cases = [
             ("", "d41d8cd98f00b204e9800998ecf8427e"),
             ("a", "0cc175b9c0f1b6a831c399e269772661"),
@@ -223,7 +236,9 @@ mod tests {
 
     #[test]
     fn split_input_hashes_the_same() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
         let mut whole = Md5::new();
         whole.consume(&data);
         for split in [0, 1, 55, 56, 63, 64, 65, 127, 128, 999] {

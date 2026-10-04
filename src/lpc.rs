@@ -50,7 +50,11 @@ const AUTOC_LANES: usize = 33;
 /// The autocorrelation one lag at a time: the definition.
 fn autocorrelation_scalar(xw: &[f64], r: &mut [f64]) {
     for (lag, r) in r.iter_mut().enumerate() {
-        *r = if lag >= xw.len() { 0.0 } else { xw[lag..].iter().zip(xw).map(|(a, b)| a * b).sum() };
+        *r = if lag >= xw.len() {
+            0.0
+        } else {
+            xw[lag..].iter().zip(xw).map(|(a, b)| a * b).sum()
+        };
     }
 }
 

@@ -20,8 +20,8 @@ mod verify;
 pub use decode::{DecodedFrame, Decoder, FrameHeader, decode_frame, parse_frame_header};
 pub use encode::{BLOCK_SIZE, Encoder, EncoderConfig, Level};
 pub use format::{
-    BLOCK_PADDING, BLOCK_SEEKTABLE, BLOCK_STREAMINFO, BLOCK_VORBIS_COMMENT, StreamInfo, block_header, crc8, crc16,
-    md5_bytes, parse_metadata_blocks, stream_info_from_extra,
+    BLOCK_PADDING, BLOCK_SEEKTABLE, BLOCK_STREAMINFO, BLOCK_VORBIS_COMMENT, StreamInfo,
+    block_header, crc8, crc16, md5_bytes, parse_metadata_blocks, stream_info_from_extra,
 };
 
 use crate::Speaker;

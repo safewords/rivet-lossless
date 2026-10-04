@@ -47,7 +47,11 @@ mod tests {
     fn results_come_back_in_order() {
         for threads in [0, 1, 2, 7, 64] {
             let got = super::map(50, threads, |i| i * i);
-            assert_eq!(got, (0..50).map(|i| i * i).collect::<Vec<_>>(), "{threads} threads");
+            assert_eq!(
+                got,
+                (0..50).map(|i| i * i).collect::<Vec<_>>(),
+                "{threads} threads"
+            );
         }
         assert!(super::map(0, 4, |i| i).is_empty());
     }

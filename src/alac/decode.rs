@@ -14,8 +14,8 @@
 //! count lands on.
 
 use super::format::{
-    Config, ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE, RiceParams, decode_residuals,
-    native_from_alac, unpredict,
+    Config, ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE, RiceParams,
+    decode_residuals, native_from_alac, unpredict,
 };
 use crate::Error;
 use crate::bits::BitReader;
@@ -38,7 +38,9 @@ pub fn decode_frame(config: &Config, packet: &[u8]) -> Result<Vec<Vec<i64>>, Err
             ID_SCE | ID_LFE | ID_CPE => {
                 let nch = if tag == ID_CPE { 2 } else { 1 };
                 if out.len() + nch > channels {
-                    return Err(err(format!("frame holds more than the cookie's {channels} channels")));
+                    return Err(err(format!(
+                        "frame holds more than the cookie's {channels} channels"
+                    )));
                 }
                 let _instance = br.read_u32(4)?;
                 if br.read_u32(12)? != 0 {
@@ -47,9 +49,16 @@ pub fn decode_frame(config: &Config, packet: &[u8]) -> Result<Vec<Vec<i64>>, Err
                 let partial = br.read_bit()?;
                 let shift_bytes = br.read_u32(2)?;
                 let escape = br.read_bit()?;
-                let n = if partial { br.read_u32(32)? as usize } else { config.frame_length as usize };
+                let n = if partial {
+                    br.read_u32(32)? as usize
+                } else {
+                    config.frame_length as usize
+                };
                 if n > config.frame_length as usize {
-                    return Err(err(format!("{n} samples in a frame of at most {}", config.frame_length)));
+                    return Err(err(format!(
+                        "{n} samples in a frame of at most {}",
+                        config.frame_length
+                    )));
                 }
                 if *frame_samples.get_or_insert(n) != n {
                     return Err(err("elements of one frame disagree on its length"));
@@ -93,7 +102,10 @@ pub fn decode_frame(config: &Config, packet: &[u8]) -> Result<Vec<Vec<i64>>, Err
         }
     }
     if out.len() != channels {
-        return Err(err(format!("frame holds {} of the cookie's {channels} channels", out.len())));
+        return Err(err(format!(
+            "frame holds {} of the cookie's {channels} channels",
+            out.len()
+        )));
     }
     Ok(out)
 }
@@ -108,7 +120,9 @@ fn decode_compressed(
     let depth = u32::from(config.bit_depth);
     let shift = shift_bytes * 8;
     if shift >= depth {
-        return Err(err(format!("{shift_bytes} shifted bytes of {depth}-bit audio")));
+        return Err(err(format!(
+            "{shift_bytes} shifted bytes of {depth}-bit audio"
+        )));
     }
     let chan_bits = depth - shift + (nch as u32 - 1);
     let mix_bits = br.read_u32(8)?;
@@ -125,8 +139,15 @@ fn decode_compressed(
         let den_shift = br.read_u32(4)?;
         let pb_factor = br.read_u32(3)?;
         let order = br.read_u32(5)? as usize;
-        let coefs = (0..order).map(|_| Ok(br.read_signed(16)? as i16)).collect::<Result<_, Error>>()?;
-        preds.push(Pred { mode, den_shift, pb_factor, coefs });
+        let coefs = (0..order)
+            .map(|_| Ok(br.read_signed(16)? as i16))
+            .collect::<Result<_, Error>>()?;
+        preds.push(Pred {
+            mode,
+            den_shift,
+            pb_factor,
+            coefs,
+        });
     }
     // The low bytes, raw and interleaved, come before the residuals.
     let mut low: Vec<Vec<i64>> = vec![Vec::new(); nch];
@@ -191,8 +212,13 @@ impl Decoder {
     /// `extra_data` is the magic cookie, in any of the wrappings
     /// [`Config::parse`] takes; it is required.
     pub fn new(extra_data: Option<&[u8]>) -> Result<Self, Error> {
-        let extra = extra_data.filter(|e| !e.is_empty()).ok_or_else(|| err("no magic cookie"))?;
-        Ok(Self { config: Config::parse(extra)?, samples_decoded: 0 })
+        let extra = extra_data
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| err("no magic cookie"))?;
+        Ok(Self {
+            config: Config::parse(extra)?,
+            samples_decoded: 0,
+        })
     }
 
     /// The magic cookie: bit depth, channel count, rate, frame length.
@@ -212,7 +238,9 @@ impl Decoder {
         let n = chans.first().map_or(0, Vec::len);
         let order = native_from_alac(self.config.num_channels);
         let chans = &chans;
-        let out: Vec<i32> = (0..n).flat_map(|i| order.iter().map(move |&c| chans[c][i] as i32)).collect();
+        let out: Vec<i32> = (0..n)
+            .flat_map(|i| order.iter().map(move |&c| chans[c][i] as i32))
+            .collect();
         self.samples_decoded += n as u64;
         Ok(out)
     }

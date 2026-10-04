@@ -15,8 +15,11 @@ fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
         let t = i as f64 / 44_100.0;
         let common = (t * 2.0 * std::f64::consts::PI * 440.0).sin() * 0.5;
         for c in 0..channels {
-            let v =
-                if i % 9000 < 700 { 0.0 } else { common * (1.0 - 0.2 * c as f64) + noise() * 0.01 * (c + 1) as f64 };
+            let v = if i % 9000 < 700 {
+                0.0
+            } else {
+                common * (1.0 - 0.2 * c as f64) + noise() * 0.01 * (c + 1) as f64
+            };
             out.push((v * full).round().clamp(-full - 1.0, full) as i32);
         }
     }
@@ -24,7 +27,13 @@ fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
 }
 
 fn round_trip(pcm: &[i32], channels: u8, bits: u8, level: Level) -> (Vec<u8>, StreamInfo) {
-    let mut enc = Encoder::new(EncoderConfig { sample_rate: 44_100, channels, bits_per_sample: bits, level }).unwrap();
+    let mut enc = Encoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels,
+        bits_per_sample: bits,
+        level,
+    })
+    .unwrap();
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     let info = enc.stream_info();
@@ -38,7 +47,10 @@ fn round_trip(pcm: &[i32], channels: u8, bits: u8, level: Level) -> (Vec<u8>, St
         got.extend(s);
         stream.extend_from_slice(f);
     }
-    assert!(got == pcm, "{channels}ch {bits}-bit {level:?}: round trip differs");
+    assert!(
+        got == pcm,
+        "{channels}ch {bits}-bit {level:?}: round trip differs"
+    );
     assert_eq!(dec.md5_matches(), Some(true), "MD5");
     (stream, info)
 }
@@ -67,8 +79,16 @@ fn edge_shapes_round_trip() {
         (signal(BLOCK_SIZE, 2, 16, 2), 2),
         (vec![0; 9_000], 2),
         (vec![1234; 9_000], 1),
-        (signal(9_000, 2, 16, 4).iter().map(|s| s & !0xFF).collect(), 2),
-        ((0..9_000).map(|i| if (i / 3) % 2 == 0 { 32_767 } else { -32_768 }).collect(), 1),
+        (
+            signal(9_000, 2, 16, 4).iter().map(|s| s & !0xFF).collect(),
+            2,
+        ),
+        (
+            (0..9_000)
+                .map(|i| if (i / 3) % 2 == 0 { 32_767 } else { -32_768 })
+                .collect(),
+            1,
+        ),
     ];
     for (pcm, ch) in cases {
         let (_, info) = round_trip(&pcm, ch, 16, Level::Default);
@@ -81,12 +101,20 @@ fn stereo_decorrelation_is_used_on_correlated_channels() {
     // Identical channels: the side channel is all zeros.
     let mono = signal(BLOCK_SIZE, 1, 16, 9);
     let pcm: Vec<i32> = mono.iter().flat_map(|&s| [s, s]).collect();
-    let mut enc =
-        Encoder::new(EncoderConfig { sample_rate: 48_000, channels: 2, bits_per_sample: 16, level: Level::Default })
-            .unwrap();
+    let mut enc = Encoder::new(EncoderConfig {
+        sample_rate: 48_000,
+        channels: 2,
+        bits_per_sample: 16,
+        level: Level::Default,
+    })
+    .unwrap();
     let frames = enc.encode_int(&pcm);
     let frame = decode_frame(&frames[0].0, None).unwrap();
-    assert!(matches!(frame.header.assignment, 8..=10), "assignment {}", frame.header.assignment);
+    assert!(
+        matches!(frame.header.assignment, 8..=10),
+        "assignment {}",
+        frame.header.assignment
+    );
     assert_eq!(frame.samples, pcm);
 }
 
@@ -97,7 +125,10 @@ fn coded_numbers_use_the_utf8_form() {
         (0x80, vec![0xC2, 0x80]),
         (0x7FF, vec![0xDF, 0xBF]),
         (0x800, vec![0xE0, 0xA0, 0x80]),
-        ((1 << 36) - 1, vec![0xFE, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+        (
+            (1 << 36) - 1,
+            vec![0xFE, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF],
+        ),
     ] {
         let mut bw = BitWriter::default();
         write_coded_number(&mut bw, v);
@@ -117,7 +148,13 @@ fn streaminfo_describes_the_stream() {
 
 /// FNV-1a of every frame the encoder makes of `pcm` on `threads` threads.
 fn stream_hash(pcm: &[i32], channels: u8, bits: u8, level: Level, threads: usize) -> u64 {
-    let mut enc = Encoder::new(EncoderConfig { sample_rate: 44_100, channels, bits_per_sample: bits, level }).unwrap();
+    let mut enc = Encoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels,
+        bits_per_sample: bits,
+        level,
+    })
+    .unwrap();
     enc.set_threads(threads);
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
@@ -139,7 +176,12 @@ fn the_encoded_bytes_do_not_change() {
         for (channels, bits) in [(2u8, 16u8), (2, 24), (6, 20), (1, 32), (2, 32), (1, 8)] {
             let mut pcm = signal(30_000, usize::from(channels), u32::from(bits), 11);
             // Some full-scale noise, for the wide residuals and escapes.
-            for (i, s) in pcm.iter_mut().enumerate().skip(20_000 * usize::from(channels)).take(2_000) {
+            for (i, s) in pcm
+                .iter_mut()
+                .enumerate()
+                .skip(20_000 * usize::from(channels))
+                .take(2_000)
+            {
                 *s = ((i as u32).wrapping_mul(2_654_435_761) as i32) >> (32 - u32::from(bits));
             }
             let h = stream_hash(&pcm, channels, bits, level, 1);
@@ -173,13 +215,21 @@ fn the_encoded_bytes_do_not_change() {
 #[test]
 fn a_wrong_md5_is_caught_with_the_hash_off_the_decoding_thread() {
     let pcm = signal(30_000, 2, 24, 11);
-    let mut enc = Encoder::new(EncoderConfig { sample_rate: 44_100, channels: 2, bits_per_sample: 24, level: Level::Fast })
-        .unwrap();
+    let mut enc = Encoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bits_per_sample: 24,
+        level: Level::Fast,
+    })
+    .unwrap();
     let mut frames = enc.encode_int(&pcm);
     frames.extend(enc.finish());
     let md5 = enc.stream_info().md5;
     let head = enc.metadata_blocks();
-    let at = head.windows(16).position(|w| w == md5).expect("the MD5 in STREAMINFO");
+    let at = head
+        .windows(16)
+        .position(|w| w == md5)
+        .expect("the MD5 in STREAMINFO");
     for (wrong, expect) in [(false, true), (true, false)] {
         let mut extra = head.clone();
         if wrong {

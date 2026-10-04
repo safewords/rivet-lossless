@@ -36,14 +36,20 @@ fn best<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: bench <file.flac> [seconds] [runs]");
+    let path = args
+        .get(1)
+        .expect("usage: bench <file.flac> [seconds] [runs]");
     let seconds: f64 = args.get(2).map_or(60.0, |s| s.parse().expect("seconds"));
     let runs: usize = args.get(3).map_or(3, |s| s.parse().expect("runs"));
     let data = std::fs::read(path).expect("read");
     assert_eq!(&data[..4], b"fLaC");
     let (info, meta) = flac::parse_metadata_blocks(&data[4..]).expect("metadata");
     let frames = &data[4 + meta..];
-    let (rate, ch, bits) = (info.sample_rate, info.channels, u32::from(info.bits_per_sample));
+    let (rate, ch, bits) = (
+        info.sample_rate,
+        info.channels,
+        u32::from(info.bits_per_sample),
+    );
 
     let (t, pcm) = best(runs, || {
         let mut d = flac::Decoder::new(Some(&data[..4 + meta]), 0, 0).expect("decoder");
@@ -103,7 +109,11 @@ fn main() {
             dur / td
         );
     }
-    let abits = if matches!(bits, 16 | 20 | 24 | 32) { bits } else { 24 };
+    let abits = if matches!(bits, 16 | 20 | 24 | 32) {
+        bits
+    } else {
+        24
+    };
     let shift = abits - bits;
     let apcm: Vec<i32> = pcm.iter().map(|&s| s << shift).collect();
     let (tm, _) = best(runs, || {

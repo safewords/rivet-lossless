@@ -36,9 +36,14 @@ impl StreamInfo {
 
     pub fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() < Self::LEN {
-            return Err(Error::Invalid(format!("flac: STREAMINFO is {} bytes, needs {}", b.len(), Self::LEN)));
+            return Err(Error::Invalid(format!(
+                "flac: STREAMINFO is {} bytes, needs {}",
+                b.len(),
+                Self::LEN
+            )));
         }
-        let be = |r: std::ops::Range<usize>| b[r].iter().fold(0u64, |v, &x| (v << 8) | u64::from(x));
+        let be =
+            |r: std::ops::Range<usize>| b[r].iter().fold(0u64, |v, &x| (v << 8) | u64::from(x));
         let packed = be(10..18);
         let info = Self {
             min_block_size: be(0..2) as u16,
@@ -82,7 +87,12 @@ impl StreamInfo {
 /// One metadata block's 4-byte header (§8.1): last-block flag, type, length.
 pub fn block_header(last: bool, kind: u8, len: usize) -> [u8; 4] {
     let len = len as u32;
-    [(u8::from(last) << 7) | kind, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    [
+        (u8::from(last) << 7) | kind,
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+    ]
 }
 
 /// Walk a run of metadata blocks (as they follow the `fLaC` marker, or fill
@@ -93,17 +103,23 @@ pub fn parse_metadata_blocks(b: &[u8]) -> Result<(StreamInfo, usize), Error> {
     let mut info = None;
     loop {
         let Some(h) = b.get(at..at + 4) else {
-            return Err(Error::Invalid("flac: metadata ends inside a block header".into()));
+            return Err(Error::Invalid(
+                "flac: metadata ends inside a block header".into(),
+            ));
         };
         let last = h[0] & 0x80 != 0;
         let kind = h[0] & 0x7F;
         let len = (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
-        let body = b
-            .get(at + 4..at + 4 + len)
-            .ok_or_else(|| Error::Invalid(format!("flac: metadata block of type {kind} runs past the data")))?;
+        let body = b.get(at + 4..at + 4 + len).ok_or_else(|| {
+            Error::Invalid(format!(
+                "flac: metadata block of type {kind} runs past the data"
+            ))
+        })?;
         if info.is_none() {
             if kind != BLOCK_STREAMINFO {
-                return Err(Error::Invalid(format!("flac: the first metadata block is type {kind}, not STREAMINFO")));
+                return Err(Error::Invalid(format!(
+                    "flac: the first metadata block is type {kind}, not STREAMINFO"
+                )));
             }
             info = Some(StreamInfo::parse(body)?);
         }
@@ -135,7 +151,10 @@ pub fn stream_info_from_extra(extra: &[u8]) -> Result<StreamInfo, Error> {
     if extra.len() > 4 && extra[..4] == [0, 0, 0, 0] && looks_like_blocks(&extra[4..]) {
         return Ok(parse_metadata_blocks(&extra[4..])?.0);
     }
-    Err(Error::Invalid(format!("flac: no STREAMINFO in the {}-byte codec configuration", extra.len())))
+    Err(Error::Invalid(format!(
+        "flac: no STREAMINFO in the {}-byte codec configuration",
+        extra.len()
+    )))
 }
 
 /// CRC-8 of a frame header (§9.1.8): polynomial x^8 + x^2 + x + 1, zero
@@ -147,7 +166,11 @@ pub fn crc8(data: &[u8]) -> u8 {
         for (i, e) in t.iter_mut().enumerate() {
             let mut c = i as u8;
             for _ in 0..8 {
-                c = if c & 0x80 != 0 { (c << 1) ^ 0x07 } else { c << 1 };
+                c = if c & 0x80 != 0 {
+                    (c << 1) ^ 0x07
+                } else {
+                    c << 1
+                };
             }
             *e = c;
         }
@@ -166,7 +189,11 @@ const CRC16_TABLES: [[u16; 256]; 16] = {
         let mut c = (i as u16) << 8;
         let mut bit = 0;
         while bit < 8 {
-            c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+            c = if c & 0x8000 != 0 {
+                (c << 1) ^ 0x8005
+            } else {
+                c << 1
+            };
             bit += 1;
         }
         t[0][i] = c;
@@ -200,7 +227,8 @@ pub fn crc16(data: &[u8]) -> u16 {
         }
         c = x;
     }
-    rest.iter().fold(c, |c, &b| (c << 8) ^ t[0][usize::from((c >> 8) as u8 ^ b)])
+    rest.iter()
+        .fold(c, |c, &b| (c << 8) ^ t[0][usize::from((c >> 8) as u8 ^ b)])
 }
 
 /// The MD5 input for interleaved samples at `bits` bits (§8.2): each sample
@@ -213,9 +241,24 @@ pub fn md5_bytes(samples: &[i32], bits: u32, out: &mut Vec<u8>) {
     // One loop per width, so each compiles to plain stores.
     match width {
         1 => dst.iter_mut().zip(samples).for_each(|(d, &s)| *d = s as u8),
-        2 => dst.as_chunks_mut::<2>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&(s as u16).to_le_bytes())),
-        3 => dst.as_chunks_mut::<3>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes()[..3])),
-        _ => dst.as_chunks_mut::<4>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes())),
+        2 => dst
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(samples)
+            .for_each(|(d, &s)| d.copy_from_slice(&(s as u16).to_le_bytes())),
+        3 => dst
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(samples)
+            .for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes()[..3])),
+        _ => dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(samples)
+            .for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes())),
     }
 }
 
@@ -261,7 +304,11 @@ mod tests {
             data.iter().fold(0u16, |mut c, &b| {
                 c ^= u16::from(b) << 8;
                 for _ in 0..8 {
-                    c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+                    c = if c & 0x8000 != 0 {
+                        (c << 1) ^ 0x8005
+                    } else {
+                        c << 1
+                    };
                 }
                 c
             })

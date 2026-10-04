@@ -22,7 +22,8 @@
 //! decodes the same everywhere.
 
 use super::format::{
-    Config, ID_END, RiceParams, element_layout, encode_residuals, native_from_alac, predict, residual_bits,
+    Config, ID_END, RiceParams, element_layout, encode_residuals, native_from_alac, predict,
+    residual_bits,
 };
 use crate::Error;
 use crate::bits::BitWriter;
@@ -56,10 +57,14 @@ impl Encoder {
     /// 32) bits; anything else is refused with `Error::Unsupported`.
     pub fn new(sample_rate: u32, channels: u8, bit_depth: u8) -> Result<Self, Error> {
         if !(1..=8).contains(&channels) {
-            return Err(Error::Unsupported(format!("alac: {channels} channels (1–8)")));
+            return Err(Error::Unsupported(format!(
+                "alac: {channels} channels (1–8)"
+            )));
         }
         if !matches!(bit_depth, 16 | 20 | 24 | 32) {
-            return Err(Error::Unsupported(format!("alac: {bit_depth}-bit samples (16, 20, 24 or 32)")));
+            return Err(Error::Unsupported(format!(
+                "alac: {bit_depth}-bit samples (16, 20, 24 or 32)"
+            )));
         }
         if sample_rate == 0 {
             return Err(Error::Unsupported("alac: sample rate 0".into()));
@@ -84,7 +89,9 @@ impl Encoder {
     pub fn cookie(&self) -> Config {
         let mut c = self.config.clone();
         if self.samples > 0 {
-            c.avg_bit_rate = (self.bytes as f64 * 8.0 * f64::from(c.sample_rate) / self.samples as f64).round() as u32;
+            c.avg_bit_rate = (self.bytes as f64 * 8.0 * f64::from(c.sample_rate)
+                / self.samples as f64)
+                .round() as u32;
         }
         c
     }
@@ -97,10 +104,15 @@ impl Encoder {
         let ch = usize::from(self.config.num_channels);
         let len = self.config.frame_length as usize;
         let whole = self.pending.len() / (len * ch);
-        let threads = if self.threads == 0 { crate::parallel::auto_threads() } else { self.threads };
+        let threads = if self.threads == 0 {
+            crate::parallel::auto_threads()
+        } else {
+            self.threads
+        };
         let this = &*self;
-        let frames =
-            crate::parallel::map(whole, threads, |i| this.code_frame(&this.pending[i * len * ch..(i + 1) * len * ch]));
+        let frames = crate::parallel::map(whole, threads, |i| {
+            this.code_frame(&this.pending[i * len * ch..(i + 1) * len * ch])
+        });
         self.pending.drain(..whole * len * ch);
         frames
             .into_iter()
@@ -138,7 +150,12 @@ impl Encoder {
         let native = native_from_alac(self.config.num_channels);
         let mut alac: Vec<Vec<i64>> = vec![Vec::new(); ch];
         for (slot, &a) in native.iter().enumerate() {
-            alac[a] = interleaved.iter().skip(slot).step_by(ch).map(|&s| i64::from(s)).collect();
+            alac[a] = interleaved
+                .iter()
+                .skip(slot)
+                .step_by(ch)
+                .map(|&s| i64::from(s))
+                .collect();
         }
         let mut bw = BitWriter::with_capacity(interleaved.len() * 3);
         let mut next = 0usize;
@@ -159,7 +176,14 @@ impl Encoder {
         self.config.max_frame_bytes = self.config.max_frame_bytes.max(bytes as u32);
     }
 
-    fn write_element(&self, bw: &mut BitWriter, tag: u32, instance: u32, chans: &[Vec<i64>], n: usize) {
+    fn write_element(
+        &self,
+        bw: &mut BitWriter,
+        tag: u32,
+        instance: u32,
+        chans: &[Vec<i64>],
+        n: usize,
+    ) {
         let depth = u32::from(self.config.bit_depth);
         let partial = n != self.config.frame_length as usize;
         let header_bits = 3 + 4 + 12 + 1 + 2 + 1 + if partial { 32 } else { 0 };
@@ -172,7 +196,10 @@ impl Encoder {
             24 | 20 => &[0, 1],
             _ => &[0],
         };
-        let compressed = shifts.iter().filter_map(|&s| self.plan_compressed(chans, s)).min_by_key(|p| p.bits);
+        let compressed = shifts
+            .iter()
+            .filter_map(|&s| self.plan_compressed(chans, s))
+            .min_by_key(|p| p.bits);
         let write_header = |bw: &mut BitWriter, shift: u32, escape: bool| {
             bw.write(u64::from(tag), 3);
             bw.write(u64::from(instance), 4);
@@ -208,9 +235,19 @@ impl Encoder {
         let shift = shift_bytes * 8;
         let nch = chans.len();
         let chan_bits = depth - shift + (nch as u32 - 1);
-        let high: Vec<Vec<i64>> = chans.iter().map(|c| c.iter().map(|&s| s >> shift).collect()).collect();
-        let low: Vec<Vec<i64>> = chans.iter().map(|c| c.iter().map(|&s| s & ((1i64 << shift) - 1)).collect()).collect();
-        let (mix_res, mixed) = if nch == 2 { best_mix(&high[0], &high[1]) } else { (0, high) };
+        let high: Vec<Vec<i64>> = chans
+            .iter()
+            .map(|c| c.iter().map(|&s| s >> shift).collect())
+            .collect();
+        let low: Vec<Vec<i64>> = chans
+            .iter()
+            .map(|c| c.iter().map(|&s| s & ((1i64 << shift) - 1)).collect())
+            .collect();
+        let (mix_res, mixed) = if nch == 2 {
+            best_mix(&high[0], &high[1])
+        } else {
+            (0, high)
+        };
         let params = RiceParams::new(&self.config, PB_FACTOR);
         let mut channels = Vec::with_capacity(nch);
         let mut bits = 8 + 8 + nch * shift as usize * chans[0].len();
@@ -220,16 +257,28 @@ impl Encoder {
                 let Some(residual) = predict(x, &coefs, DEN_SHIFT, chan_bits) else {
                     continue;
                 };
-                let b = 4 + 4 + 3 + 5 + 16 * coefs.len() + residual_bits(&params, &residual, chan_bits);
+                let b =
+                    4 + 4 + 3 + 5 + 16 * coefs.len() + residual_bits(&params, &residual, chan_bits);
                 if best.as_ref().is_none_or(|p| b < p.bits) {
-                    best = Some(ChannelPlan { coefs, residual, bits: b });
+                    best = Some(ChannelPlan {
+                        coefs,
+                        residual,
+                        bits: b,
+                    });
                 }
             }
             let best = best?;
             bits += best.bits;
             channels.push(best);
         }
-        Some(ElementPlan { shift_bytes, chan_bits, mix_res, low, channels, bits })
+        Some(ElementPlan {
+            shift_bytes,
+            chan_bits,
+            mix_res,
+            low,
+            channels,
+            bits,
+        })
     }
 
     fn write_compressed(&self, bw: &mut BitWriter, plan: &ElementPlan) {
@@ -280,7 +329,11 @@ struct ElementPlan {
 /// the channels as they are; otherwise the pair becomes
 /// `u = (w·L + (1-w)·R)`, `v = L - R` with `w = mix_res / 4`.
 fn best_mix(l: &[i64], r: &[i64]) -> (i32, Vec<Vec<i64>>) {
-    let roughness = |x: &[i64]| x.windows(2).map(|w| (w[1] - w[0]).unsigned_abs()).sum::<u64>();
+    let roughness = |x: &[i64]| {
+        x.windows(2)
+            .map(|w| (w[1] - w[0]).unsigned_abs())
+            .sum::<u64>()
+    };
     let mut best = (0i32, u64::MAX, Vec::new());
     for mix_res in 0..=(1i32 << MIX_BITS) {
         let (u, v): (Vec<i64>, Vec<i64>) = if mix_res == 0 {
@@ -288,7 +341,10 @@ fn best_mix(l: &[i64], r: &[i64]) -> (i32, Vec<Vec<i64>>) {
         } else {
             let m = 1i64 << MIX_BITS;
             let w = i64::from(mix_res);
-            l.iter().zip(r).map(|(&a, &b)| ((w * a + (m - w) * b) >> MIX_BITS, a - b)).unzip()
+            l.iter()
+                .zip(r)
+                .map(|(&a, &b)| ((w * a + (m - w) * b) >> MIX_BITS, a - b))
+                .unzip()
         };
         let cost = roughness(&u) + roughness(&v);
         if cost < best.1 {
@@ -312,7 +368,13 @@ fn seed_coefficients(x: &[i64]) -> Vec<Vec<i16>> {
         .iter()
         .filter_map(|&o| coefs.get(o - 1))
         .map(|c| {
-            c.iter().map(|&v| (v * f64::from(1u32 << DEN_SHIFT)).round().clamp(-32_768.0, 32_767.0) as i16).collect()
+            c.iter()
+                .map(|&v| {
+                    (v * f64::from(1u32 << DEN_SHIFT))
+                        .round()
+                        .clamp(-32_768.0, 32_767.0) as i16
+                })
+                .collect()
         })
         .collect();
     if out.is_empty() {

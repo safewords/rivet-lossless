@@ -102,19 +102,19 @@ pub fn parse_frame_header(data: &[u8], info: Option<&StreamInfo>) -> Result<Fram
         14 => br.read_u32(16)? * 10,
         _ => return Err(err("invalid sample rate code 15")),
     };
-    let bits_per_sample = match bps_code {
-        0 => u32::from(
-            info.map(|i| i.bits_per_sample)
-                .ok_or_else(|| err("frame defers its bit depth to a STREAMINFO there is none of"))?,
-        ),
-        1 => 8,
-        2 => 12,
-        4 => 16,
-        5 => 20,
-        6 => 24,
-        7 => 32,
-        _ => return Err(err("reserved bit depth code 3")),
-    };
+    let bits_per_sample =
+        match bps_code {
+            0 => u32::from(info.map(|i| i.bits_per_sample).ok_or_else(|| {
+                err("frame defers its bit depth to a STREAMINFO there is none of")
+            })?),
+            1 => 8,
+            2 => 12,
+            4 => 16,
+            5 => 20,
+            6 => 24,
+            7 => 32,
+            _ => return Err(err("reserved bit depth code 3")),
+        };
     let channels = match assignment {
         0..=7 => assignment + 1,
         8..=10 => 2,
@@ -193,7 +193,10 @@ pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFra
     let nch = chans.len();
     let mut samples = vec![0i32; n * nch];
     match chans.as_slice() {
-        [mono] => samples.iter_mut().zip(mono).for_each(|(d, &s)| *d = s as i32),
+        [mono] => samples
+            .iter_mut()
+            .zip(mono)
+            .for_each(|(d, &s)| *d = s as i32),
         [l, r] => {
             for ((d, &l), &r) in samples.as_chunks_mut::<2>().0.iter_mut().zip(l).zip(r) {
                 d[0] = l as i32;
@@ -208,7 +211,11 @@ pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFra
             }
         }
     }
-    Ok(DecodedFrame { header, samples, len: body + 2 })
+    Ok(DecodedFrame {
+        header,
+        samples,
+        len: body + 2,
+    })
 }
 
 fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64>, Error> {
@@ -216,14 +223,20 @@ fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64
         return Err(err("subframe padding bit is set"));
     }
     let kind = br.read_u32(6)?;
-    let wasted = if br.read_bit()? { br.read_unary_zeros()? + 1 } else { 0 };
+    let wasted = if br.read_bit()? {
+        br.read_unary_zeros()? + 1
+    } else {
+        0
+    };
     if wasted >= bps {
         return Err(err(format!("{wasted} wasted bits of a {bps}-bit subframe")));
     }
     let bps = bps - wasted;
     let mut out = match kind {
         0 => vec![br.read_signed(bps)?; n],
-        1 => (0..n).map(|_| br.read_signed(bps)).collect::<Result<_, _>>()?,
+        1 => (0..n)
+            .map(|_| br.read_signed(bps))
+            .collect::<Result<_, _>>()?,
         8..=12 => {
             let order = (kind - 8) as usize;
             let mut s = warmup(br, n, order, bps)?;
@@ -242,7 +255,9 @@ fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64
             if shift < 0 {
                 return Err(err(format!("negative LPC shift {shift}")));
             }
-            let coefs: Vec<i64> = (0..order).map(|_| br.read_signed(precision)).collect::<Result<_, _>>()?;
+            let coefs: Vec<i64> = (0..order)
+                .map(|_| br.read_signed(precision))
+                .collect::<Result<_, _>>()?;
             decode_residual(br, n, order, &mut s)?;
             restore_lpc(&mut s, &coefs, shift as u32);
             s
@@ -259,7 +274,9 @@ fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64
 
 fn warmup(br: &mut BitReader<'_>, n: usize, order: usize, bps: u32) -> Result<Vec<i64>, Error> {
     if order > n {
-        return Err(err(format!("predictor order {order} exceeds the block size {n}")));
+        return Err(err(format!(
+            "predictor order {order} exceeds the block size {n}"
+        )));
     }
     let mut s = Vec::with_capacity(n);
     for _ in 0..order {
@@ -269,7 +286,12 @@ fn warmup(br: &mut BitReader<'_>, n: usize, order: usize, bps: u32) -> Result<Ve
 }
 
 /// Append the block's residual (§9.2.7) to `out`, which holds the warm-up.
-fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec<i64>) -> Result<(), Error> {
+fn decode_residual(
+    br: &mut BitReader<'_>,
+    n: usize,
+    order: usize,
+    out: &mut Vec<i64>,
+) -> Result<(), Error> {
     let (param_bits, escape) = match br.read_u32(2)? {
         0 => (4, 15),
         1 => (5, 31),
@@ -278,7 +300,9 @@ fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec
     let partition_order = br.read_u32(4)?;
     let partitions = 1usize << partition_order;
     if !n.is_multiple_of(partitions) || n >> partition_order < order {
-        return Err(err(format!("partition order {partition_order} does not fit a {n}-sample block of order {order}")));
+        return Err(err(format!(
+            "partition order {partition_order} does not fit a {n}-sample block of order {order}"
+        )));
     }
     let mut at = out.len();
     out.resize(n, 0);
@@ -418,7 +442,10 @@ impl Decoder {
             Some(e) if !e.is_empty() => Some(stream_info_from_extra(e)?),
             _ => None,
         };
-        let md5 = info.as_ref().filter(|i| i.md5 != [0; 16]).map(|_| Md5Verifier::new());
+        let md5 = info
+            .as_ref()
+            .filter(|i| i.md5 != [0; 16])
+            .map(|_| Md5Verifier::new());
         Ok(Self {
             bits: info.as_ref().map_or(16, |i| u32::from(i.bits_per_sample)),
             sample_rate: info.as_ref().map_or(sample_rate, |i| i.sample_rate),
@@ -466,7 +493,9 @@ impl Decoder {
             at += frame.len;
             let h = frame.header;
             if !out.is_empty() && (h.channels != self.channels || h.bits_per_sample != self.bits) {
-                return Err(err("frames of one packet change channel count or bit depth"));
+                return Err(err(
+                    "frames of one packet change channel count or bit depth",
+                ));
             }
             self.channels = h.channels;
             self.bits = h.bits_per_sample;
@@ -511,8 +540,15 @@ mod restore_tests {
         for order in 1..=32usize {
             for (bits, prec) in [(16u32, 12u32), (24, 15), (33, 15)] {
                 let coefs: Vec<i64> = (0..order).map(|_| rand() >> (32 - prec)).collect();
-                let res: Vec<i64> =
-                    (0..300).map(|i| if i < order { rand() >> (32 - bits.min(32)) } else { rand() >> 20 }).collect();
+                let res: Vec<i64> = (0..300)
+                    .map(|i| {
+                        if i < order {
+                            rand() >> (32 - bits.min(32))
+                        } else {
+                            rand() >> 20
+                        }
+                    })
+                    .collect();
                 for shift in [0u32, 9, 15] {
                     let mut a = res.clone();
                     let mut b = res.clone();

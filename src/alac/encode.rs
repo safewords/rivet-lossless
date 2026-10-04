@@ -47,6 +47,8 @@ pub struct Encoder {
     pending: Vec<i32>,
     samples: u64,
     bytes: u64,
+    /// Threads for a batch of whole frames; 0 is the machine's count.
+    threads: usize,
 }
 
 impl Encoder {
@@ -62,7 +64,13 @@ impl Encoder {
         if sample_rate == 0 {
             return Err(Error::Unsupported("alac: sample rate 0".into()));
         }
-        Ok(Self { config: Config::new(sample_rate, channels, bit_depth), pending: Vec::new(), samples: 0, bytes: 0 })
+        Ok(Self {
+            config: Config::new(sample_rate, channels, bit_depth),
+            pending: Vec::new(),
+            samples: 0,
+            bytes: 0,
+            threads: 0,
+        })
     }
 
     /// The cookie as configured: rate, channels, depth, frame length, and the
@@ -76,8 +84,7 @@ impl Encoder {
     pub fn cookie(&self) -> Config {
         let mut c = self.config.clone();
         if self.samples > 0 {
-            c.avg_bit_rate =
-                (self.bytes as f64 * 8.0 * f64::from(c.sample_rate) / self.samples as f64).round() as u32;
+            c.avg_bit_rate = (self.bytes as f64 * 8.0 * f64::from(c.sample_rate) / self.samples as f64).round() as u32;
         }
         c
     }
@@ -90,13 +97,26 @@ impl Encoder {
         let ch = usize::from(self.config.num_channels);
         let len = self.config.frame_length as usize;
         let whole = self.pending.len() / (len * ch);
-        let mut out = Vec::with_capacity(whole);
-        for i in 0..whole {
-            let block = self.pending[i * len * ch..(i + 1) * len * ch].to_vec();
-            out.push((self.encode_frame(&block), len as u32));
-        }
+        let threads = if self.threads == 0 { crate::parallel::auto_threads() } else { self.threads };
+        let this = &*self;
+        let frames =
+            crate::parallel::map(whole, threads, |i| this.code_frame(&this.pending[i * len * ch..(i + 1) * len * ch]));
         self.pending.drain(..whole * len * ch);
-        out
+        frames
+            .into_iter()
+            .map(|frame| {
+                self.count_frame(len, frame.len());
+                (frame, len as u32)
+            })
+            .collect()
+    }
+
+    /// How many threads code a batch of whole frames (the frames one
+    /// [`encode_int`](Self::encode_int) call completes): 0, the default,
+    /// is one per CPU; 1 codes everything on the caller's thread. The
+    /// stream is the same byte for byte whatever the count.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
     }
 
     /// Encode what is left as a final, shorter frame.
@@ -106,10 +126,12 @@ impl Encoder {
         }
         let block = std::mem::take(&mut self.pending);
         let n = block.len() / usize::from(self.config.num_channels);
-        vec![(self.encode_frame(&block), n as u32)]
+        let frame = self.code_frame(&block);
+        self.count_frame(n, frame.len());
+        vec![(frame, n as u32)]
     }
 
-    fn encode_frame(&mut self, interleaved: &[i32]) -> Vec<u8> {
+    fn code_frame(&self, interleaved: &[i32]) -> Vec<u8> {
         let ch = usize::from(self.config.num_channels);
         let n = interleaved.len() / ch;
         // ALAC channel `a` is the native slot that maps to it.
@@ -128,11 +150,13 @@ impl Encoder {
             next += count;
         }
         bw.write(u64::from(ID_END), 3);
-        let frame = bw.into_bytes();
+        bw.into_bytes()
+    }
+
+    fn count_frame(&mut self, n: usize, bytes: usize) {
         self.samples += n as u64;
-        self.bytes += frame.len() as u64;
-        self.config.max_frame_bytes = self.config.max_frame_bytes.max(frame.len() as u32);
-        frame
+        self.bytes += bytes as u64;
+        self.config.max_frame_bytes = self.config.max_frame_bytes.max(bytes as u32);
     }
 
     fn write_element(&self, bw: &mut BitWriter, tag: u32, instance: u32, chans: &[Vec<i64>], n: usize) {
@@ -185,8 +209,7 @@ impl Encoder {
         let nch = chans.len();
         let chan_bits = depth - shift + (nch as u32 - 1);
         let high: Vec<Vec<i64>> = chans.iter().map(|c| c.iter().map(|&s| s >> shift).collect()).collect();
-        let low: Vec<Vec<i64>> =
-            chans.iter().map(|c| c.iter().map(|&s| s & ((1i64 << shift) - 1)).collect()).collect();
+        let low: Vec<Vec<i64>> = chans.iter().map(|c| c.iter().map(|&s| s & ((1i64 << shift) - 1)).collect()).collect();
         let (mix_res, mixed) = if nch == 2 { best_mix(&high[0], &high[1]) } else { (0, high) };
         let params = RiceParams::new(&self.config, PB_FACTOR);
         let mut channels = Vec::with_capacity(nch);
@@ -194,7 +217,9 @@ impl Encoder {
         for x in &mixed {
             let mut best: Option<ChannelPlan> = None;
             for coefs in seed_coefficients(x) {
-                let Some(residual) = predict(x, &coefs, DEN_SHIFT, chan_bits) else { continue };
+                let Some(residual) = predict(x, &coefs, DEN_SHIFT, chan_bits) else {
+                    continue;
+                };
                 let b = 4 + 4 + 3 + 5 + 16 * coefs.len() + residual_bits(&params, &residual, chan_bits);
                 if best.as_ref().is_none_or(|p| b < p.bits) {
                     best = Some(ChannelPlan { coefs, residual, bits: b });
@@ -287,9 +312,7 @@ fn seed_coefficients(x: &[i64]) -> Vec<Vec<i16>> {
         .iter()
         .filter_map(|&o| coefs.get(o - 1))
         .map(|c| {
-            c.iter()
-                .map(|&v| (v * f64::from(1u32 << DEN_SHIFT)).round().clamp(-32_768.0, 32_767.0) as i16)
-                .collect()
+            c.iter().map(|&v| (v * f64::from(1u32 << DEN_SHIFT)).round().clamp(-32_768.0, 32_767.0) as i16).collect()
         })
         .collect();
     if out.is_empty() {

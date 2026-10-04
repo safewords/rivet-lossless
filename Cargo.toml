@@ -17,8 +17,10 @@ exclude = [".github/"]
 [lib]
 name = "lossless"
 
+[features]
+# Compile out the run-time selection of the AVX2 code paths, leaving only
+# the baseline build of every kernel (for testing the fallback).
+force-scalar = []
+
 [dependencies]
-# STREAMINFO's MD5 of the unencoded audio: written by the FLAC encoder,
-# checked by the decoder.
-md5 = "0.7"
 thiserror = "2"

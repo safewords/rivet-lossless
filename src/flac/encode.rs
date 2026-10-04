@@ -84,9 +84,13 @@ pub struct Encoder {
     max_frame: u32,
     /// The size of the only block, while there has been one.
     last_block: usize,
-    md5: md5::Context,
+    md5: crate::md5::Md5,
     md5_scratch: Vec<u8>,
     md5_digest: Option<[u8; 16]>,
+    /// Threads for a batch of whole frames; 0 is the machine's count.
+    threads: usize,
+    /// The analysis window of a whole block.
+    window: Vec<f64>,
 }
 
 impl Encoder {
@@ -110,9 +114,11 @@ impl Encoder {
             min_frame: u32::MAX,
             max_frame: 0,
             last_block: 0,
-            md5: md5::Context::new(),
+            md5: crate::md5::Md5::new(),
             md5_scratch: Vec::new(),
             md5_digest: None,
+            threads: 0,
+            window: if config.level.max_lpc_order() > 0 { lpc::tukey(BLOCK_SIZE, 0.5) } else { Vec::new() },
         })
     }
 
@@ -121,19 +127,40 @@ impl Encoder {
         &self.config
     }
 
+    /// How many threads code a batch of whole frames (the frames one
+    /// [`encode_int`](Self::encode_int) call completes): 0, the default,
+    /// is one per CPU; 1 codes everything on the caller's thread. The
+    /// stream is the same byte for byte whatever the count.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
+    }
+
     /// Encode interleaved integer samples; returns the frames completed, each
     /// with its sample count.
     pub fn encode_int(&mut self, samples: &[i32]) -> Vec<(Vec<u8>, u32)> {
         self.pending.extend_from_slice(samples);
         let ch = usize::from(self.config.channels);
-        let whole = self.pending.len() / (BLOCK_SIZE * ch);
-        let mut out = Vec::with_capacity(whole);
-        for i in 0..whole {
-            let block = self.pending[i * BLOCK_SIZE * ch..(i + 1) * BLOCK_SIZE * ch].to_vec();
-            out.push((self.encode_block(&block), BLOCK_SIZE as u32));
+        let len = BLOCK_SIZE * ch;
+        let whole = self.pending.len() / len;
+        let bps = u32::from(self.config.bits_per_sample);
+        for block in self.pending[..whole * len].chunks_exact(len) {
+            self.md5_scratch.clear();
+            md5_bytes(block, bps, &mut self.md5_scratch);
+            self.md5.consume(&self.md5_scratch);
         }
-        self.pending.drain(..whole * BLOCK_SIZE * ch);
-        out
+        let threads = if self.threads == 0 { crate::parallel::auto_threads() } else { self.threads };
+        let (config, first, window, pending) = (&self.config, self.frames, &self.window, &self.pending);
+        let frames = crate::parallel::map(whole, threads, |i| {
+            encode_frame(config, first + i as u64, &pending[i * len..(i + 1) * len], window)
+        });
+        self.pending.drain(..whole * len);
+        frames
+            .into_iter()
+            .map(|frame| {
+                self.count_frame(BLOCK_SIZE, frame.len());
+                (frame, BLOCK_SIZE as u32)
+            })
+            .collect()
     }
 
     /// Encode what is left as a final, shorter frame and seal the MD5.
@@ -145,7 +172,7 @@ impl Encoder {
             out.push((self.encode_block(&block), n as u32));
         }
         if self.md5_digest.is_none() {
-            self.md5_digest = Some(self.md5.clone().compute().0);
+            self.md5_digest = Some(self.md5.compute());
         }
         out
     }
@@ -181,53 +208,69 @@ impl Encoder {
         self.md5_scratch.clear();
         md5_bytes(interleaved, bps, &mut self.md5_scratch);
         self.md5.consume(&self.md5_scratch);
+        let frame = encode_frame(&self.config, self.frames, interleaved, &self.window);
+        self.count_frame(n, frame.len());
+        frame
+    }
 
-        let chans: Vec<Vec<i64>> =
-            (0..ch).map(|c| interleaved.iter().skip(c).step_by(ch).map(|&s| i64::from(s)).collect()).collect();
-        let level = self.config.level;
-        let (assignment, subframes) = if ch == 2 {
-            let (l, r) = (&chans[0], &chans[1]);
-            let mid: Vec<i64> = l.iter().zip(r).map(|(a, b)| (a + b) >> 1).collect();
-            let side: Vec<i64> = l.iter().zip(r).map(|(a, b)| a - b).collect();
-            let pl = plan_subframe(l, bps, level);
-            let pr = plan_subframe(r, bps, level);
-            let pm = plan_subframe(&mid, bps, level);
-            let ps = plan_subframe(&side, bps + 1, level);
-            let options = [
-                (1u8, pl.bits + pr.bits),
-                (8, pl.bits + ps.bits),
-                (9, ps.bits + pr.bits),
-                (10, pm.bits + ps.bits),
-            ];
-            let best = options.iter().min_by_key(|o| o.1).expect("four options").0;
-            let pair = match best {
-                1 => vec![pl, pr],
-                8 => vec![pl, ps],
-                9 => vec![ps, pr],
-                _ => vec![pm, ps],
-            };
-            (best, pair)
-        } else {
-            ((ch - 1) as u8, chans.iter().map(|c| plan_subframe(c, bps, level)).collect())
-        };
-
-        let mut bw = BitWriter::with_capacity(n * ch * bps as usize / 8 + 64);
-        write_frame_header(&mut bw, self.frames, n, self.config.sample_rate, assignment, bps);
-        for s in &subframes {
-            write_subframe(&mut bw, s);
-        }
-        bw.align();
-        let crc = crc16(bw.bytes());
-        bw.write(u64::from(crc), 16);
-        let frame = bw.into_bytes();
-
+    fn count_frame(&mut self, n: usize, bytes: usize) {
         self.frames += 1;
         self.samples += n as u64;
         self.last_block = n;
-        self.min_frame = self.min_frame.min(frame.len() as u32);
-        self.max_frame = self.max_frame.max(frame.len() as u32);
-        frame
+        self.min_frame = self.min_frame.min(bytes as u32);
+        self.max_frame = self.max_frame.max(bytes as u32);
     }
+}
+
+/// Code one block as frame number `frame`. `window` is the analysis window
+/// of a whole block (`BLOCK_SIZE`), used when the block is one.
+fn encode_frame(config: &EncoderConfig, frame: u64, interleaved: &[i32], window: &[f64]) -> Vec<u8> {
+    let ch = usize::from(config.channels);
+    let n = interleaved.len() / ch;
+    let bps = u32::from(config.bits_per_sample);
+    let chans: Vec<Vec<i64>> =
+        (0..ch).map(|c| interleaved.iter().skip(c).step_by(ch).map(|&s| i64::from(s)).collect()).collect();
+    let level = config.level;
+    let own;
+    let window = if level.max_lpc_order() == 0 || n < 2 {
+        &[][..]
+    } else if window.len() == n {
+        window
+    } else {
+        own = lpc::tukey(n, 0.5);
+        &own[..]
+    };
+    let (assignment, subframes) = if ch == 2 {
+        let (l, r) = (&chans[0], &chans[1]);
+        let mid: Vec<i64> = l.iter().zip(r).map(|(a, b)| (a + b) >> 1).collect();
+        let side: Vec<i64> = l.iter().zip(r).map(|(a, b)| a - b).collect();
+        let pl = plan_subframe(l, bps, level, window);
+        let pr = plan_subframe(r, bps, level, window);
+        let pm = plan_subframe(&mid, bps, level, window);
+        let ps = plan_subframe(&side, bps + 1, level, window);
+        let options =
+            [(1u8, pl.bits + pr.bits), (8, pl.bits + ps.bits), (9, ps.bits + pr.bits), (10, pm.bits + ps.bits)];
+        let best = options.iter().min_by_key(|o| o.1).expect("four options").0;
+        let pair = match best {
+            1 => vec![pl, pr],
+            8 => vec![pl, ps],
+            9 => vec![ps, pr],
+            _ => vec![pm, ps],
+        };
+        (best, pair)
+    } else {
+        ((ch - 1) as u8, chans.iter().map(|c| plan_subframe(c, bps, level, window)).collect())
+    };
+
+    let mut bw = BitWriter::with_capacity(n * ch * bps as usize / 8 + 64);
+    write_frame_header(&mut bw, frame, n, config.sample_rate, assignment, bps);
+    for s in &subframes {
+        write_subframe(&mut bw, s);
+    }
+    bw.align();
+    let crc = crc16(bw.bytes());
+    bw.write(u64::from(crc), 16);
+    bw.into_bytes()
 }
 
 /// The frame header (§9.1) of a fixed-block-size stream, CRC-8 included.
@@ -283,8 +326,7 @@ fn write_frame_header(bw: &mut BitWriter, frame: u64, n: usize, rate: u32, assig
     if let Some((v, n)) = sr_extra {
         bw.write(v, n);
     }
-    let bytes = bw.bytes();
-    let crc = crc8(&bytes[start / 8..]);
+    let crc = crc8(&bw.bytes()[start / 8..]);
     bw.write(u64::from(crc), 8);
 }
 
@@ -345,9 +387,20 @@ struct RicePlan {
     /// Coding method 1 (5-bit parameters) when some parameter needs it.
     wide: bool,
     bits: usize,
+    /// Per partition, the OR of its folded values.
+    ors: Vec<u32>,
 }
 
-fn plan_subframe(x: &[i64], bps: u32, level: Level) -> SubframePlan {
+/// Working buffers of one subframe's planning, reused across candidates.
+#[derive(Default)]
+struct Scratch {
+    /// The candidate residual.
+    residual: Vec<i64>,
+    /// Its folded (zigzag) form.
+    folded: Vec<u32>,
+}
+
+fn plan_subframe(x: &[i64], bps: u32, level: Level, window: &[f64]) -> SubframePlan {
     let n = x.len();
     // Constant: one sample.
     if x.iter().all(|&v| v == x[0]) {
@@ -376,28 +429,35 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level) -> SubframePlan {
         rice: None,
         bits: header + n * ebps as usize,
     };
+    let mut scratch = Scratch::default();
 
-    // Fixed predictors. `Fast` estimates the order from the residual sums;
-    // the others price every order exactly.
-    let fixed: Vec<(usize, Vec<i64>)> = (0..=4.min(n.saturating_sub(1))).map(|o| (o, fixed_residual(&best.samples, o))).collect();
-    let candidates: Vec<&(usize, Vec<i64>)> = if level == Level::Fast {
-        fixed
-            .iter()
-            .min_by_key(|(_, r)| r.iter().map(|v| v.unsigned_abs()).sum::<u64>())
-            .into_iter()
-            .collect()
+    // Fixed predictors. `Fast` estimates the order from the residual sums
+    // (the first of the smallest); the others price every order exactly.
+    let orders = 0..=4.min(n.saturating_sub(1));
+    if level == Level::Fast {
+        let mut pick: Option<(u64, usize)> = None;
+        for order in orders {
+            fixed_residual(&best.samples, order, &mut scratch.residual);
+            let sum: u64 = scratch.residual.iter().map(|v| v.unsigned_abs()).sum();
+            if pick.is_none_or(|(s, _)| sum < s) {
+                pick = Some((sum, order));
+            }
+        }
+        if let Some((_, order)) = pick {
+            fixed_residual(&best.samples, order, &mut scratch.residual);
+            consider(&mut best, SubKind::Fixed(order), &mut scratch, header + order * ebps as usize, level);
+        }
     } else {
-        fixed.iter().collect()
-    };
-    for (order, res) in candidates {
-        consider(&mut best, SubKind::Fixed(*order), res.clone(), header + *order * ebps as usize, level);
+        for order in orders {
+            fixed_residual(&best.samples, order, &mut scratch.residual);
+            consider(&mut best, SubKind::Fixed(order), &mut scratch, header + order * ebps as usize, level);
+        }
     }
 
     // LPC.
     let max_order = level.max_lpc_order().min(n.saturating_sub(1));
     if max_order > 0 {
-        let window = lpc::tukey(n, 0.5);
-        let r = lpc::autocorrelation(&best.samples, &window, max_order);
+        let r = lpc::autocorrelation(&best.samples, window, max_order);
         let (coefs, errors) = lpc::levinson(&r, max_order);
         let precision: u32 = if ebps <= 16 { 13 } else { 15 };
         let orders: Vec<usize> = if level == Level::Best {
@@ -411,112 +471,214 @@ fn plan_subframe(x: &[i64], bps: u32, level: Level) -> SubframePlan {
             };
             (1..=coefs.len()).min_by(|&a, &b| est(a).total_cmp(&est(b))).into_iter().collect()
         };
+        // The samples as i32 when they all fit, for the vector residual.
+        let narrow: Option<Vec<i32>> = best.samples.iter().map(|&v| i32::try_from(v).ok()).collect();
         for order in orders {
             let (q, shift) = lpc::quantize(&coefs[order - 1], precision, 15);
-            let Some(res) = lpc_residual(&best.samples, &q, shift) else { continue };
+            if !lpc_residual(&best.samples, narrow.as_deref(), &q, shift, &mut scratch.residual) {
+                continue;
+            }
             let head = header + order * ebps as usize + 4 + 5 + order * precision as usize;
-            consider(&mut best, SubKind::Lpc { coefs: q, precision, shift }, res, head, level);
+            consider(&mut best, SubKind::Lpc { coefs: q, precision, shift }, &mut scratch, head, level);
         }
     }
     best
 }
 
-/// Replace `best` with the predicted form when its residual codes smaller.
-fn consider(best: &mut SubframePlan, kind: SubKind, residual: Vec<i64>, head_bits: usize, level: Level) {
-    // Residuals a decoder cannot hold in 32 bits are not an option.
-    if residual.iter().any(|&r| r.unsigned_abs() >= 1 << 30) {
+/// Replace `best` with the predicted form when its residual (in
+/// `scratch.residual`) codes smaller.
+fn consider(best: &mut SubframePlan, kind: SubKind, scratch: &mut Scratch, head_bits: usize, level: Level) {
+    // Residuals a decoder cannot hold in 32 bits are not an option; the
+    // rest fold into 31 bits.
+    if !fold(&scratch.residual, &mut scratch.folded) {
         return;
     }
     let n = best.samples.len();
-    let rice = plan_rice(&residual, n, kind.order(), level.max_partition_order());
+    let rice = plan_rice(&scratch.folded, n, kind.order(), level.max_partition_order());
     let bits = head_bits + rice.bits;
     if bits < best.bits {
         best.kind = kind;
-        best.residual = residual;
+        best.residual.clear();
+        best.residual.extend_from_slice(&scratch.residual);
         best.rice = Some(rice);
         best.bits = bits;
     }
 }
 
-fn fixed_residual(x: &[i64], order: usize) -> Vec<i64> {
-    (order..x.len())
-        .map(|i| {
-            x[i] - match order {
-                0 => 0,
-                1 => x[i - 1],
-                2 => 2 * x[i - 1] - x[i - 2],
-                3 => 3 * x[i - 1] - 3 * x[i - 2] + x[i - 3],
-                _ => 4 * x[i - 1] - 6 * x[i - 2] + 4 * x[i - 3] - x[i - 4],
-            }
-        })
-        .collect()
+/// The fixed predictor's residual of `order` (§9.2.5) into `out`.
+fn fixed_residual(x: &[i64], order: usize, out: &mut Vec<i64>) {
+    out.clear();
+    if x.len() <= order {
+        return;
+    }
+    // One straight-line loop per order, which vectorises.
+    match order {
+        0 => out.extend_from_slice(x),
+        1 => out.extend(x.windows(2).map(|w| w[1] - w[0])),
+        2 => out.extend(x.windows(3).map(|w| w[2] - 2 * w[1] + w[0])),
+        3 => out.extend(x.windows(4).map(|w| w[3] - 3 * w[2] + 3 * w[1] - w[0])),
+        _ => out.extend(x.windows(5).map(|w| w[4] - 4 * w[3] + 6 * w[2] - 4 * w[1] + w[0])),
+    }
 }
 
-fn lpc_residual(x: &[i64], coefs: &[i32], shift: i32) -> Option<Vec<i64>> {
+/// The LPC residual into `out`; `false` when the prediction overflows 64
+/// bits (only possible for samples beyond 32 bits). `narrow` is `x` as
+/// i32 when it fits, which takes the vector kernel: 15-bit coefficients
+/// times 32-bit samples, 32 of them, stay well inside 64 bits, so its
+/// result is the checked loop's.
+fn lpc_residual(x: &[i64], narrow: Option<&[i32]>, coefs: &[i32], shift: i32, out: &mut Vec<i64>) -> bool {
     let order = coefs.len();
-    let mut out = Vec::with_capacity(x.len() - order);
+    out.clear();
+    if x.len() <= order {
+        return true;
+    }
+    if let Some(x32) = narrow
+        && order <= 32
+        && coefs.iter().all(|c| c.unsigned_abs() < 1 << 15)
+    {
+        out.resize(x.len() - order, 0);
+        lpc_residual_narrow(x32, coefs, shift as u32, out);
+        return true;
+    }
     for i in order..x.len() {
         let mut acc: i64 = 0;
         for (j, &c) in coefs.iter().enumerate() {
-            acc = acc.checked_add(i64::from(c).checked_mul(x[i - 1 - j])?)?;
+            let Some(next) = i64::from(c).checked_mul(x[i - 1 - j]).and_then(|p| acc.checked_add(p)) else {
+                return false;
+            };
+            acc = next;
         }
         out.push(x[i] - (acc >> shift));
     }
-    Some(out)
+    true
 }
 
-fn zigzag(r: i64) -> u64 {
-    ((r << 1) ^ (r >> 63)) as u64
+crate::simd::multiversion! {
+/// [`lpc_residual`]'s vector kernel: `out[i - order] = x[i] - (Σ c[j] ·
+/// x[i - 1 - j]) >> shift`, the order a compile-time constant so the sum
+/// unrolls and the loop over `i` vectorises (32 × 32 → 64-bit multiplies).
+fn lpc_residual_narrow(x: &[i32], coefs: &[i32], shift: u32, out: &mut [i64]) {
+    macro_rules! orders {
+        ($($n:literal)*) => {
+            match coefs.len() {
+                $($n => residual_n::<$n>(x, coefs, shift, out),)*
+                _ => unreachable!("LPC orders are 1 to 32"),
+            }
+        };
+    }
+    orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
+}
 }
 
-/// Choose the partition order and per-partition parameters for a residual
-/// of a block of `n` samples with predictor order `order`.
-fn plan_rice(residual: &[i64], n: usize, order: usize, max_order: u32) -> RicePlan {
-    let u: Vec<u64> = residual.iter().map(|&r| zigzag(r)).collect();
+#[inline(always)]
+fn residual_n<const N: usize>(x: &[i32], coefs: &[i32], shift: u32, out: &mut [i64]) {
+    let c: [i64; N] = std::array::from_fn(|j| i64::from(coefs[j]));
+    for (o, w) in out.iter_mut().zip(x.windows(N + 1)) {
+        let mut acc = 0i64;
+        for j in 0..N {
+            acc += c[j] * i64::from(w[N - 1 - j]);
+        }
+        *o = i64::from(w[N]) - (acc >> shift);
+    }
+}
+
+crate::simd::multiversion! {
+/// The residual folded to unsigned (zigzag: 0, -1, 1, -2, … → 0, 1, 2, 3,
+/// …) into `out`; `false` when some value is 2^30 or more in magnitude
+/// (the decoder's 32-bit limit with room for the fold).
+fn fold(residual: &[i64], out: &mut Vec<u32>) -> bool {
+    out.clear();
+    out.resize(residual.len(), 0);
+    let mut wide = 0u64;
+    for (o, &r) in out.iter_mut().zip(residual) {
+        wide |= r.unsigned_abs();
+        *o = ((r << 1) ^ (r >> 63)) as u32;
+    }
+    wide < 1 << 30
+}
+}
+
+/// Per partition of the finest order: the sum of the folded values and
+/// their OR (whose top bit gives the escape's width).
+struct PartitionStats {
+    sum: u64,
+    or: u32,
+    count: usize,
+}
+
+crate::simd::multiversion! {
+/// Sum and OR of each `per`-value partition of `u`, the first `order`
+/// values shorter.
+fn partition_stats(u: &[u32], parts: usize, per: usize, order: usize) -> Vec<PartitionStats> {
+    let mut at = 0usize;
+    (0..parts)
+        .map(|p| {
+            let count = per - if p == 0 { order } else { 0 };
+            let part = &u[at..at + count];
+            at += count;
+            let sum = part.iter().map(|&v| u64::from(v)).sum();
+            let or = part.iter().fold(0, |a, &v| a | v);
+            PartitionStats { sum, or, count }
+        })
+        .collect()
+}
+}
+
+crate::simd::multiversion! {
+/// `Σ v >> k` over a partition: the Rice code's quotient bits.
+fn quotient_bits(part: &[u32], k: u32) -> u64 {
+    part.iter().map(|&v| u64::from(v >> k)).sum()
+}
+}
+
+/// Choose the partition order and per-partition parameters for the folded
+/// residual `u` of a block of `n` samples with predictor order `order`.
+fn plan_rice(u: &[u32], n: usize, order: usize, max_order: u32) -> RicePlan {
     // Finest partitioning allowed: the block divides evenly and the first
     // partition still holds more than the warm-up.
     let mut top = 0u32;
     while top < max_order.min(15) && n.is_multiple_of(1 << (top + 1)) && (n >> (top + 1)) > order {
         top += 1;
     }
-    // Sums per partition at the finest order, merged pairwise going up.
+    // Sums per partition at the finest order, merged pairwise going up;
+    // each order is priced from its sums alone.
     let parts = 1usize << top;
     let per = n >> top;
-    let mut sums = vec![0u64; parts];
-    let mut counts = vec![0usize; parts];
-    let mut at = 0usize;
-    for p in 0..parts {
-        let count = per - if p == 0 { order } else { 0 };
-        sums[p] = u[at..at + count].iter().sum();
-        counts[p] = count;
-        at += count;
-    }
-    let mut best: Option<RicePlan> = None;
-    let mut level = top as i32;
-    while level >= 0 {
-        let mut plan_params = Vec::with_capacity(sums.len());
+    let finest = partition_stats(u, parts, per, order);
+    let mut merged: Vec<(u64, usize)> = finest.iter().map(|s| (s.sum, s.count)).collect();
+    let mut best: Option<(u32, usize)> = None;
+    for level in (0..=top).rev() {
         let mut bits = 2 + 4;
         let mut wide = false;
-        for (&sum, &count) in sums.iter().zip(&counts) {
+        for &(sum, count) in &merged {
             let k = best_k(sum, count);
             wide |= k > 14;
-            plan_params.push(k);
             bits += count * (k as usize + 1) + (sum >> k) as usize;
         }
-        bits += plan_params.len() * if wide { 5 } else { 4 };
-        let candidate = RicePlan { order: level as u32, params: plan_params.into_iter().map(Ok).collect(), wide, bits };
-        if best.as_ref().is_none_or(|b| candidate.bits < b.bits) {
-            best = Some(candidate);
+        bits += merged.len() * if wide { 5 } else { 4 };
+        if best.is_none_or(|(_, b)| bits < b) {
+            best = Some((level, bits));
         }
-        if level == 0 {
-            break;
+        for i in 0..merged.len() / 2 {
+            merged[i] = (merged[2 * i].0 + merged[2 * i + 1].0, merged[2 * i].1 + merged[2 * i + 1].1);
         }
-        sums = sums.chunks(2).map(|c| c.iter().sum()).collect();
-        counts = counts.chunks(2).map(|c| c.iter().sum()).collect();
-        level -= 1;
+        merged.truncate(merged.len() / 2);
     }
-    let mut plan = best.expect("partition order 0 always exists");
-    exact_rice(&mut plan, &u, n, order);
+    // The chosen order's partitions, again from the finest.
+    let (level, bits) = best.expect("partition order 0 always exists");
+    let group = 1usize << (top - level);
+    let mut params = Vec::with_capacity(1 << level);
+    let mut ors = Vec::with_capacity(1 << level);
+    let mut wide = false;
+    for g in finest.chunks(group) {
+        let (sum, count) = g.iter().fold((0u64, 0usize), |(s, c), p| (s + p.sum, c + p.count));
+        let k = best_k(sum, count);
+        wide |= k > 14;
+        params.push(Ok(k));
+        ors.push(g.iter().fold(0, |o, p| o | p.or));
+    }
+    let mut plan = RicePlan { order: level, params, wide, bits, ors };
+    exact_rice(&mut plan, u, n, order);
     plan
 }
 
@@ -540,7 +702,7 @@ fn best_k(sum: u64, count: usize) -> u32 {
 
 /// Re-price the chosen partitioning exactly, taking the raw-bits escape for
 /// any partition where it is smaller.
-fn exact_rice(plan: &mut RicePlan, u: &[u64], n: usize, order: usize) {
+fn exact_rice(plan: &mut RicePlan, u: &[u32], n: usize, order: usize) {
     let per = n >> plan.order;
     let mut at = 0usize;
     let mut bits = 2 + 4;
@@ -549,16 +711,13 @@ fn exact_rice(plan: &mut RicePlan, u: &[u64], n: usize, order: usize) {
         let part = &u[at..at + count];
         at += count;
         let k = param.expect("planned as Rice");
-        let rice: usize = part.iter().map(|&v| (v >> k) as usize + 1 + k as usize).sum();
+        let rice = count * (1 + k as usize) + quotient_bits(part, k) as usize;
         // The escape: 5 bits of width, then every value in that many bits.
-        let width = part
-            .iter()
-            .map(|&v| {
-                let r = ((v >> 1) as i64) ^ -((v & 1) as i64);
-                if r == 0 { 0 } else { 65 - if r < 0 { r.leading_ones() } else { r.leading_zeros() } }
-            })
-            .max()
-            .unwrap_or(0);
+        // A value `r` takes the bits of `r ^ (r >> 63)` (the folded value
+        // halved) plus a sign bit, and 0 takes none: the widest follows
+        // from the OR of the partition's folded values.
+        let or = plan.ors[p];
+        let width = if or == 0 { 0 } else { 33 - (or >> 1).leading_zeros() };
         let escape = 5 + count * width as usize;
         let escape_code = if plan.wide { 31 } else { 15 };
         if escape < rice && width <= 31 || k >= escape_code {
@@ -570,6 +729,10 @@ fn exact_rice(plan: &mut RicePlan, u: &[u64], n: usize, order: usize) {
     }
     bits += plan.params.len() * if plan.wide { 5 } else { 4 };
     plan.bits = bits;
+}
+
+fn zigzag(r: i64) -> u64 {
+    ((r << 1) ^ (r >> 63)) as u64
 }
 
 fn write_subframe(bw: &mut BitWriter, s: &SubframePlan) {
@@ -632,8 +795,7 @@ fn write_residual(bw: &mut BitWriter, s: &SubframePlan) {
                 bw.write(u64::from(k), param_bits);
                 for &r in part {
                     let u = zigzag(r);
-                    bw.write_unary_zeros((u >> k) as u32);
-                    bw.write(u & ((1u64 << k) - 1), k);
+                    bw.write_rice((u >> k) as u32, u, k);
                 }
             }
             Err(width) => {

@@ -18,8 +18,9 @@ anything that has FLAC or ALAC packets and wants PCM back, or PCM and wants
 FLAC or ALAC.
 
 Published as `rivet-lossless`; **imported as `lossless`** (`use lossless::…`).
-Two dependencies (`md5`, for FLAC's audio signature, and `thiserror`), no
-features, no build script.
+One dependency (`thiserror`; the MD5 of FLAC's audio signature is this
+crate's own, from RFC 1321), no build script. One feature, `force-scalar`,
+for testing (see [Speed](#speed)).
 
 ```toml
 [dependencies]
@@ -130,6 +131,48 @@ maps an integer sample of `b` bits to `s / 2^(b-1)` and back by the
 inverse: exact for every depth up to 24 bits (the f32 significand), so
 FLAC / ALAC → f32 → FLAC / ALAC is bit-exact end to end at 24 bits or
 less; a 32-bit sample keeps its top 24 bits.
+
+## Speed
+
+On a Ryzen 9 9950X (Windows, a shared machine, best of five), in multiples
+of real time, for the first 60 s of a 16-bit and a 24-bit stereo 44.1 kHz
+album track; `cargo run --release --example bench -- <file.flac>` measures
+it on any FLAC file. Encoders on one thread, then on all of them.
+
+| | 16-bit before | 16-bit now | 24-bit before | 24-bit now |
+|---|---|---|---|---|
+| FLAC decode (the whole file, MD5 checked) | 424 | 1527 | 417 | 1317 |
+| FLAC encode `Fast` | 262 | 949 / 1696 threaded | 305 | 917 / 1135 |
+| FLAC encode `Default` | 116 | 613 / 1316 | 131 | 574 / 983 |
+| FLAC encode `Best` | 35 | 169 / 1149 | 37 | 189 / 962 |
+| ALAC encode | 154 | 275 / 1193 | 90 | 159 / 745 |
+| ALAC decode | 231 | 496 | 226 | 435 |
+
+What does it: a bit reader that takes each Rice code from a 64-bit
+register, and LPC and fixed-predictor restoration unrolled per order with
+the newest sample in a register; slicing-by-16 CRC-16 and a faster MD5;
+in the encoders, the autocorrelation computed for every lag at once, the
+LPC residual as 32 × 32 → 64-bit vector multiplies, the Rice partition
+search from per-partition sums and ORs without per-value passes, and the
+ALAC predictor's coefficient update without its data-dependent exit.
+
+**Vector code** is selected at run time: on x86-64 the kernels are built
+twice, for the baseline and with AVX2, and CPUID picks; on aarch64 NEON is
+the baseline. Every kernel is integer code or floating point summed in a
+fixed order without fused multiply-add, so **the output is the same to the
+bit on every CPU and code path** — decoders trivially (lossless), encoders
+too: `the_encoded_bytes_do_not_change` holds both encoders to hashes of
+their output from before this work, on every level, depth and layout
+tested. The `force-scalar` feature compiles the run-time selection out
+(CI runs the tests both ways, on x86-64 and arm64).
+
+**Threads**: the encoders code the whole frames one `encode_int` call
+completes on scoped threads, one per CPU by default
+(`Encoder::set_threads(1)` keeps everything on the caller's thread); the
+stream is the same byte for byte whatever the count. A caller feeding one
+frame's worth at a time gets no threading. The decoders are
+single-threaded: the MD5 check is one serial hash over the stream, and a
+third of a 24-bit decode.
 
 ## How it is checked
 

@@ -86,3 +86,42 @@ fn short_and_silent_streams_round_trip() {
     round_trip(&signal(100, 2, 16, 1), 2, 16);
 }
 
+/// FNV-1a of every frame the encoder makes of `pcm` on `threads` threads.
+fn stream_hash(pcm: &[i32], channels: u8, bits: u8, threads: usize) -> u64 {
+    let mut enc = Encoder::new(48_000, channels, bits).unwrap();
+    enc.set_threads(threads);
+    let mut frames = enc.encode_int(pcm);
+    frames.extend(enc.finish());
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in frames.iter().flat_map(|f| f.0.iter()) {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn the_encoded_bytes_do_not_change() {
+    // The encoder is integer code but for the LPC seed, whose floating
+    // point runs in a fixed order, so its output is the same on every CPU
+    // and code path; these are the hashes of its output before the vector
+    // kernels and threads went in.
+    let mut got = Vec::new();
+    for (channels, bits) in [(2u8, 16u8), (2, 24), (6, 20), (1, 32), (2, 32), (3, 16)] {
+        let mut pcm = signal(30_000, usize::from(channels), u32::from(bits), 11);
+        for (i, s) in pcm.iter_mut().enumerate().skip(20_000 * usize::from(channels)).take(2_000) {
+            *s = ((i as u32).wrapping_mul(2_654_435_761) as i32) >> (32 - u32::from(bits));
+        }
+        let h = stream_hash(&pcm, channels, bits, 1);
+        assert_eq!(stream_hash(&pcm, channels, bits, 3), h, "threaded");
+        got.push(h);
+    }
+    let want: [u64; 6] = [
+        0x8cfa0cbfbd2207f9,
+        0xf8b42f199c8531ae,
+        0x758af59d664ef8bd,
+        0xbb8d0ffd3798fabf,
+        0x70ee7f1f37306bad,
+        0xf90d1402aa5ab52c,
+    ];
+    assert_eq!(got, want, "{got:#018x?}");
+}

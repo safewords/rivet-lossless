@@ -28,7 +28,10 @@ mod error;
 pub mod flac;
 mod layout;
 mod lpc;
+mod md5;
+mod parallel;
 pub mod pcm;
+mod simd;
 
 pub use error::{Error, Result};
 pub use layout::Speaker;

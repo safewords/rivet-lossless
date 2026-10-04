@@ -28,16 +28,78 @@ pub(crate) fn tukey(n: usize, p: f64) -> Vec<f64> {
 }
 
 /// The autocorrelation of `x · window` at lags `0..=max_lag`.
+///
+/// Every lag is summed in the same order, sample 0 first, starting from
+/// `-0.0` (what `Iterator::sum` starts from), with separate multiplies and
+/// adds, so the result is the same to the bit on every CPU and every code
+/// path; the vector paths only compute several lags side by side.
 pub(crate) fn autocorrelation(x: &[i64], window: &[f64], max_lag: usize) -> Vec<f64> {
     let xw: Vec<f64> = x.iter().zip(window).map(|(&s, &w)| s as f64 * w).collect();
-    (0..=max_lag)
-        .map(|lag| {
-            if lag >= xw.len() {
-                return 0.0;
-            }
-            xw[lag..].iter().zip(&xw).map(|(a, b)| a * b).sum()
-        })
-        .collect()
+    let mut r = vec![0.0; max_lag + 1];
+    if max_lag < AUTOC_LANES {
+        autocorrelation_lanes(&xw, &mut r);
+    } else {
+        autocorrelation_scalar(&xw, &mut r);
+    }
+    r
+}
+
+/// Lags computed side by side: enough for FLAC's order 32.
+const AUTOC_LANES: usize = 33;
+
+/// The autocorrelation one lag at a time: the definition.
+fn autocorrelation_scalar(xw: &[f64], r: &mut [f64]) {
+    for (lag, r) in r.iter_mut().enumerate() {
+        *r = if lag >= xw.len() { 0.0 } else { xw[lag..].iter().zip(xw).map(|(a, b)| a * b).sum() };
+    }
+}
+
+crate::simd::multiversion! {
+/// Every lag at once, one sample at a time: `acc[lag] += xw[i + lag] ·
+/// xw[i]`, which keeps each lag's own order of summation and vectorises
+/// across the lags. Lags whose sum has ended (`i + lag` past the end) drop
+/// out in the tail loop, which is the definition's own.
+fn autocorrelation_lanes(xw: &[f64], r: &mut [f64]) {
+    let lags = r.len();
+    let n = xw.len();
+    // Up to 8 lags in a narrower accumulator, so the common orders do not
+    // carry the work of 33.
+    if lags <= 8 {
+        autocorrelation_block::<8>(xw, r);
+    } else if lags <= 16 {
+        autocorrelation_block::<16>(xw, r);
+    } else {
+        autocorrelation_block::<AUTOC_LANES>(xw, r);
+    }
+    for (lag, r) in r.iter_mut().enumerate() {
+        if lag >= n {
+            *r = 0.0;
+        }
+    }
+}
+}
+
+#[inline(always)]
+fn autocorrelation_block<const L: usize>(xw: &[f64], r: &mut [f64]) {
+    let lags = r.len();
+    let n = xw.len();
+    let mut acc = [-0.0f64; L];
+    // Every lag of the block is in range for these samples.
+    let body = n.saturating_sub(L - 1);
+    for i in 0..body {
+        let x = xw[i];
+        let ahead: &[f64; L] = xw[i..i + L].try_into().expect("L samples");
+        for l in 0..L {
+            acc[l] += ahead[l] * x;
+        }
+    }
+    for i in body..n {
+        let x = xw[i];
+        for l in 0..lags.min(n - i) {
+            acc[l] += xw[i + l] * x;
+        }
+    }
+    r.copy_from_slice(&acc[..lags]);
 }
 
 /// Levinson-Durbin: the predictor of every order `1..=max_order` for the
@@ -139,6 +201,28 @@ mod tests {
         assert!((f64::from(q[0]) / 1024.0 - 1.9).abs() < 1e-3);
         let (q, shift) = quantize(&[0.0, 0.0], 12, 15);
         assert_eq!((q, shift), (vec![0, 0], 0));
+    }
+
+    #[test]
+    fn autocorrelation_is_the_definition_to_the_bit() {
+        let mut seed = 5u32;
+        for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 32, 33, 34, 100, 4096] {
+            let x: Vec<i64> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    i64::from(seed as i32 >> 8)
+                })
+                .collect();
+            let w = tukey(n, 0.5);
+            let xw: Vec<f64> = x.iter().zip(&w).map(|(&s, &w)| s as f64 * w).collect();
+            for max_lag in [0usize, 1, 7, 8, 12, 15, 16, 31, 32] {
+                let got = autocorrelation(&x, &w, max_lag);
+                let mut want = vec![0.0; max_lag + 1];
+                autocorrelation_scalar(&xw, &mut want);
+                let bits = |v: &[f64]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "n {n} lag {max_lag}");
+            }
+        }
     }
 
     #[test]

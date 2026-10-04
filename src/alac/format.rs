@@ -28,9 +28,9 @@
 //! the 32-bit range a reference decoder works in, so what it writes decodes
 //! identically everywhere.
 
+use crate::Error;
 use crate::bits::{BitReader, BitWriter};
 use crate::pcm::sign_extend;
-use crate::Error;
 
 /// Element tags in a frame.
 pub const ID_SCE: u32 = 0;
@@ -111,9 +111,9 @@ impl Config {
         } else if let Some(i) = extra.windows(4).position(|w| w == b"alac") {
             // `alac` atom: 4-byte size before the type, 4 bytes of
             // version/flags after it.
-            extra.get(i + 8..i + 8 + Self::LEN).ok_or_else(|| {
-                Error::Invalid("alac: magic cookie truncated after its atom header".into())
-            })?
+            extra
+                .get(i + 8..i + 8 + Self::LEN)
+                .ok_or_else(|| Error::Invalid("alac: magic cookie truncated after its atom header".into()))?
         } else {
             return Err(Error::Invalid(format!(
                 "alac: {}-byte codec configuration is not an ALACSpecificConfig",
@@ -135,10 +135,7 @@ impl Config {
             sample_rate: be32(20),
         };
         if c.compatible_version != 0 {
-            return Err(Error::Unsupported(format!(
-                "alac: magic cookie compatible version {}",
-                c.compatible_version
-            )));
+            return Err(Error::Unsupported(format!("alac: magic cookie compatible version {}", c.compatible_version)));
         }
         if !matches!(c.bit_depth, 16 | 20 | 24 | 32) {
             return Err(Error::Unsupported(format!("alac: bit depth {}", c.bit_depth)));
@@ -224,11 +221,7 @@ pub struct RiceParams {
 
 impl RiceParams {
     pub fn new(config: &Config, pb_factor: u32) -> Self {
-        Self {
-            pb: u32::from(config.pb) * pb_factor / 4,
-            mb: u32::from(config.mb),
-            kb: u32::from(config.kb),
-        }
+        Self { pb: u32::from(config.pb) * pb_factor / 4, mb: u32::from(config.mb), kb: u32::from(config.kb) }
     }
 }
 
@@ -306,7 +299,9 @@ pub(crate) fn decode_residuals(
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history
+                .wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb))
+                .wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
@@ -344,7 +339,9 @@ pub(crate) fn encode_residuals(bw: &mut BitWriter, p: &RiceParams, residuals: &[
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history
+                .wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb))
+                .wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
@@ -370,7 +367,13 @@ pub(crate) fn residual_bits(p: &RiceParams, residuals: &[i32], sample_bits: u32)
         if q >= MAX_PREFIX {
             return (MAX_PREFIX + escape_bits) as usize;
         }
-        let tail = if k <= 1 { 0 } else if value.is_multiple_of(m) { k - 1 } else { k };
+        let tail = if k <= 1 {
+            0
+        } else if value.is_multiple_of(m) {
+            k - 1
+        } else {
+            k
+        };
         (q + 1 + tail) as usize
     };
     let n = residuals.len();
@@ -388,7 +391,9 @@ pub(crate) fn residual_bits(p: &RiceParams, residuals: &[i32], sample_bits: u32)
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history
+                .wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb))
+                .wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
@@ -457,6 +462,84 @@ impl Lms {
     }
 }
 
+/// The adaptive predictor of a compile-time order: the same arithmetic as
+/// [`Lms`], with the coefficients in registers and the loops unrolled.
+struct LmsN<const N: usize> {
+    coefs: [i64; N],
+    den_shift: u32,
+    in_range: bool,
+}
+
+impl<const N: usize> LmsN<N> {
+    /// The prediction for sample `i` of `out` (`i > N`).
+    #[inline(always)]
+    fn predict(&mut self, out: &[i64], i: usize) -> i64 {
+        let win: &[i64; N] = out[i - N..i].try_into().expect("N samples");
+        let top = out[i - N - 1];
+        let mut sum: i64 = 0;
+        for j in 0..N {
+            sum += self.coefs[j] * (win[N - 1 - j] - top);
+        }
+        if sum > i64::from(i32::MAX) || sum < i64::from(i32::MIN) {
+            self.in_range = false;
+        }
+        let rounding = if self.den_shift > 0 { 1i64 << (self.den_shift - 1) } else { 0 };
+        top + ((sum + rounding) >> self.den_shift)
+    }
+
+    /// Step the coefficients after sample `i` came out with error `err`:
+    /// [`Lms::adapt`] without its data-dependent early exit. The error left
+    /// to explain only moves one way (every step takes away a share of the
+    /// same sign as `err`), so "the loop has not stopped before `j`" is
+    /// whether the error left before `j` still has that sign, and the
+    /// updates past the stop are masked to nothing instead of branched
+    /// around; a zero error changes nothing by itself.
+    #[inline(always)]
+    fn adapt(&mut self, out: &[i64], i: usize, err: i64) {
+        let s = sign(err);
+        let win: &[i64; N] = out[i - N..i].try_into().expect("N samples");
+        let top = out[i - N - 1];
+        let mut spent = 0i64;
+        for j in (0..N).rev() {
+            let d = top - win[N - 1 - j];
+            let step = s * sign(d);
+            // The error left is nonzero and of `err`'s sign.
+            let left = err - spent;
+            let live = i64::from((left ^ err) >= 0 && left != 0);
+            self.coefs[j] -= step * live;
+            spent += (N - j) as i64 * ((s * d.abs()) >> self.den_shift);
+        }
+    }
+}
+
+/// Run `$body` with `$lms` the predictor for `$coefs`: of a compile-time
+/// order for the orders encoders use, the general one otherwise.
+macro_rules! with_lms {
+    ($coefs:expr, $den_shift:expr, |$lms:ident| $body:expr) => {{
+        let coefs: &[i16] = $coefs;
+        macro_rules! fixed {
+            ($n:literal) => {{
+                let mut $lms = LmsN::<$n> {
+                    coefs: std::array::from_fn(|j| i64::from(coefs[j])),
+                    den_shift: $den_shift,
+                    in_range: true,
+                };
+                $body
+            }};
+        }
+        match coefs.len() {
+            4 => fixed!(4),
+            8 => fixed!(8),
+            16 => fixed!(16),
+            _ => {
+                let mut $lms =
+                    Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift: $den_shift, in_range: true };
+                $body
+            }
+        }
+    }};
+}
+
 /// Undo the predictor in place: `data` holds residuals and becomes samples
 /// of `bits` bits. `order` 31 is the plain first-order integrator.
 pub fn unpredict(data: &mut [i64], coefs: &[i16], order: usize, den_shift: u32, bits: u32) {
@@ -474,13 +557,14 @@ pub fn unpredict(data: &mut [i64], coefs: &[i16], order: usize, den_shift: u32, 
     for i in 1..warm {
         data[i] = sign_extend(data[i] + data[i - 1], bits);
     }
-    let mut lms = Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift, in_range: true };
-    for i in warm..n {
-        let err = data[i];
-        let pred = lms.predict(data, i);
-        data[i] = sign_extend(pred + err, bits);
-        lms.adapt(data, i, err);
-    }
+    with_lms!(coefs, den_shift, |lms| {
+        for i in warm..n {
+            let err = data[i];
+            let pred = lms.predict(data, i);
+            data[i] = sign_extend(pred + err, bits);
+            lms.adapt(data, i, err);
+        }
+    })
 }
 
 /// Run the predictor forward over `samples` (of `bits` bits): the
@@ -489,30 +573,33 @@ pub fn unpredict(data: &mut [i64], coefs: &[i16], order: usize, den_shift: u32, 
 pub fn predict(samples: &[i64], coefs: &[i16], den_shift: u32, bits: u32) -> Option<Vec<i32>> {
     let n = samples.len();
     let order = coefs.len();
-    let mut res: Vec<i64> = Vec::with_capacity(n);
+    let mut res: Vec<i32> = Vec::with_capacity(n);
     if n == 0 {
         return Some(Vec::new());
     }
-    res.push(samples[0]);
+    res.push(i32::try_from(samples[0]).ok()?);
     if order == 0 {
-        res.extend_from_slice(&samples[1..]);
+        for &s in &samples[1..] {
+            res.push(i32::try_from(s).ok()?);
+        }
     } else {
         let warm = (order + 1).min(n);
         for i in 1..warm {
-            res.push(sign_extend(samples[i] - samples[i - 1], bits));
+            res.push(i32::try_from(sign_extend(samples[i] - samples[i - 1], bits)).ok()?);
         }
-        let mut lms = Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift, in_range: true };
-        for i in warm..n {
-            let pred = lms.predict(samples, i);
-            let err = sign_extend(samples[i] - pred, bits);
-            res.push(err);
-            lms.adapt(samples, i, err);
-            if !lms.in_range {
-                return None;
+        with_lms!(coefs, den_shift, |lms| {
+            for i in warm..n {
+                let pred = lms.predict(samples, i);
+                let err = sign_extend(samples[i] - pred, bits);
+                res.push(i32::try_from(err).ok()?);
+                lms.adapt(samples, i, err);
+                if !lms.in_range {
+                    return None;
+                }
             }
-        }
+        })
     }
-    res.into_iter().map(|r| i32::try_from(r).ok()).collect()
+    Some(res)
 }
 
 #[cfg(test)]
@@ -564,6 +651,51 @@ mod tests {
         let mut br = BitReader::new(&bytes, "alac");
         assert_eq!(decode_residuals(&mut br, &p, r.len(), 17).unwrap(), r);
         assert_eq!(br.pos(), bits);
+    }
+
+    #[test]
+    fn the_fixed_order_predictors_match_the_general_one() {
+        let x: Vec<i64> =
+            (0..3000).map(|i| ((i as f64 * 0.031).sin() * 9_000.0) as i64 + (i * 7919 % 61) as i64).collect();
+        let mut seed = 3u32;
+        for order in [4usize, 8, 16] {
+            for _ in 0..5 {
+                let coefs: Vec<i16> = (0..order)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (seed >> 16) as i16 >> 4
+                    })
+                    .collect();
+                // The general predictor, by way of a coefficient list
+                // whose order no fixed predictor takes.
+                let general = |data: &[i64]| -> (Vec<i64>, bool) {
+                    let mut lms =
+                        Lms { coefs: coefs.iter().map(|&c| i64::from(c)).collect(), den_shift: 9, in_range: true };
+                    let mut res = data[..=order].to_vec();
+                    for i in order + 1..data.len() {
+                        let pred = lms.predict(data, i);
+                        let err = sign_extend(data[i] - pred, 17);
+                        res.push(err);
+                        lms.adapt(data, i, err);
+                    }
+                    (res, lms.in_range)
+                };
+                let (want, in_range) = general(&x);
+                match predict(&x, &coefs, 9, 17) {
+                    Some(got) => {
+                        assert!(in_range);
+                        assert_eq!(
+                            got.iter().skip(order + 1).map(|&r| i64::from(r)).collect::<Vec<_>>(),
+                            want[order + 1..]
+                        );
+                        let mut back: Vec<i64> = got.iter().map(|&r| i64::from(r)).collect();
+                        unpredict(&mut back, &coefs, order, 9, 17);
+                        assert_eq!(back, x);
+                    }
+                    None => assert!(!in_range || want.iter().any(|r| i32::try_from(*r).is_err())),
+                }
+            }
+        }
     }
 
     #[test]

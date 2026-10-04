@@ -39,7 +39,27 @@ impl<'a> BitReader<'a> {
         ))
     }
 
+    /// The 64 bits from the read position on, MSB first, zero past the end
+    /// of the data. At least 57 of them are the data's whenever that much
+    /// is left: a whole 8-byte load shifted by the bit offset.
+    #[inline(always)]
+    fn peek64(&self) -> u64 {
+        let byte = self.pos >> 3;
+        let off = (self.pos & 7) as u32;
+        let word = match self.data.get(byte..byte + 8) {
+            Some(b) => u64::from_be_bytes(b.try_into().expect("8 bytes")),
+            None => {
+                let mut b = [0u8; 8];
+                let tail = self.data.get(byte..).unwrap_or(&[]);
+                b[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(b)
+            }
+        };
+        word << off
+    }
+
     /// Read `n` (≤ 64) bits as an unsigned value.
+    #[inline]
     pub fn read(&mut self, n: u32) -> Result<u64, Error> {
         debug_assert!(n <= 64);
         if n == 0 {
@@ -48,32 +68,32 @@ impl<'a> BitReader<'a> {
         if n as usize > self.remaining() {
             return Err(self.overrun(n));
         }
-        let mut v: u64 = 0;
-        let mut left = n;
-        while left > 0 {
-            let byte = self.data[self.pos / 8];
-            let off = (self.pos % 8) as u32;
-            let avail = 8 - off;
-            let take = avail.min(left);
-            let bits = (u64::from(byte) >> (avail - take)) & ((1u64 << take) - 1);
-            v = if take == 64 { bits } else { (v << take) | bits };
-            left -= take;
-            self.pos += take as usize;
+        if n <= 56 {
+            let v = self.peek64() >> (64 - n);
+            self.pos += n as usize;
+            return Ok(v);
         }
-        Ok(v)
+        let hi = self.peek64() >> 32;
+        self.pos += 32;
+        let lo = self.peek64() >> (96 - n);
+        self.pos += n as usize - 32;
+        Ok((hi << (n - 32)) | lo)
     }
 
     /// Read `n` (≤ 32) bits as an unsigned value.
+    #[inline]
     pub fn read_u32(&mut self, n: u32) -> Result<u32, Error> {
         debug_assert!(n <= 32);
         Ok(self.read(n)? as u32)
     }
 
+    #[inline]
     pub fn read_bit(&mut self) -> Result<bool, Error> {
         Ok(self.read(1)? == 1)
     }
 
     /// Read `n` (1..=64) bits as a two's-complement value.
+    #[inline]
     pub fn read_signed(&mut self, n: u32) -> Result<i64, Error> {
         if n == 0 {
             return Ok(0);
@@ -85,38 +105,123 @@ impl<'a> BitReader<'a> {
 
     /// Count `0` bits up to the next `1`, and consume that `1` (FLAC's
     /// unary: the quotient of a Rice code, the wasted-bits count).
+    #[inline]
     pub fn read_unary_zeros(&mut self) -> Result<u32, Error> {
         let mut n = 0u32;
         loop {
-            if self.pos >= self.data.len() * 8 {
+            let left = self.remaining();
+            if left == 0 {
                 return Err(self.overrun(1));
             }
-            let byte = self.data[self.pos / 8];
-            let off = self.pos % 8;
-            let rest = byte << off;
-            if rest != 0 {
-                let z = rest.leading_zeros();
+            // Bits of `peek64` that are the data's.
+            let valid = (64 - (self.pos & 7)).min(left) as u32;
+            let z = self.peek64().leading_zeros();
+            if z < valid {
                 self.pos += z as usize + 1;
                 return Ok(n + z);
             }
-            let skipped = 8 - off as u32;
-            n += skipped;
-            self.pos += skipped as usize;
+            n += valid;
+            self.pos += valid as usize;
         }
+    }
+
+    /// A FLAC Rice code with parameter `k` (≤ 32): the unary quotient, then
+    /// `k` low bits, as the folded (zigzag) value. One load when the code
+    /// fits the 57 bits a load holds, which is all but the escapes of
+    /// pathological streams.
+    #[inline(always)]
+    pub fn read_rice(&mut self, k: u32) -> Result<u64, Error> {
+        debug_assert!(k <= 32);
+        let left = self.remaining();
+        let peek = self.peek64();
+        let z = peek.leading_zeros();
+        let len = z + 1 + k;
+        if len <= 57 && (len as usize) <= left {
+            // `peek << z << 1` drops the quotient and its stop bit; `k` may
+            // be 0, so the low bits come by two shifts that never reach 64.
+            let low = ((peek << z) << 1) >> 1 >> (63 - k);
+            self.pos += len as usize;
+            return Ok((u64::from(z) << k) | low);
+        }
+        let q = u64::from(self.read_unary_zeros()?);
+        Ok((q << k) | self.read(k)?)
+    }
+
+    /// A run of FLAC Rice codes with parameter `k` (≤ 32), unfolded to
+    /// signed residuals in `out`. The same as [`read_rice`](Self::read_rice)
+    /// per value, with the position kept in a register and no end-of-data
+    /// test while a whole 8-byte load still fits.
+    pub fn read_rice_block(&mut self, k: u32, out: &mut [i64]) -> Result<(), Error> {
+        debug_assert!(k <= 32);
+        let data = self.data;
+        // Positions whose 8-byte load lies wholly inside the data; such a
+        // load holds at least 57 of the data's bits.
+        let fast_end = data.len().saturating_sub(7) * 8;
+        let mut pos = self.pos;
+        // The bits from `pos` on, MSB first, of which `avail` are loaded;
+        // a code is taken from the register while it fits, and the
+        // register reloaded from `pos` when it does not, which keeps the
+        // memory load off the chain from one code to the next.
+        let mut cache = 0u64;
+        let mut avail = 0u32;
+        for o in out.iter_mut() {
+            let mut z = cache.leading_zeros();
+            if z + 1 + k > avail {
+                if pos >= fast_end {
+                    self.pos = pos;
+                    let u = self.read_rice(k)?;
+                    pos = self.pos;
+                    avail = 0;
+                    cache = 0;
+                    *o = (u >> 1) as i64 ^ -((u & 1) as i64);
+                    continue;
+                }
+                let byte = pos >> 3;
+                cache = u64::from_be_bytes(data[byte..byte + 8].try_into().expect("8 bytes")) << (pos & 7);
+                avail = 64 - (pos & 7) as u32;
+                z = cache.leading_zeros();
+                if z + 1 + k > avail {
+                    // A quotient longer than a load: the general path.
+                    self.pos = pos;
+                    let u = self.read_rice(k)?;
+                    pos = self.pos;
+                    avail = 0;
+                    cache = 0;
+                    *o = (u >> 1) as i64 ^ -((u & 1) as i64);
+                    continue;
+                }
+            }
+            let len = z + 1 + k;
+            let u = (u64::from(z) << k) | (((cache << z) << 1) >> 1 >> (63 - k));
+            // `len` may be 64 (a 63-bit quotient in a full register).
+            cache = if len < 64 { cache << len } else { 0 };
+            avail -= len;
+            pos += len as usize;
+            *o = (u >> 1) as i64 ^ -((u & 1) as i64);
+        }
+        self.pos = pos;
+        Ok(())
     }
 
     /// Count `1` bits up to the next `0` or until `limit` of them have been
     /// read, consuming the `0` when one ends the run (ALAC's unary prefix,
     /// which has an escape at `limit`).
     pub fn read_unary_ones(&mut self, limit: u32) -> Result<u32, Error> {
-        let mut n = 0u32;
-        while n < limit {
-            if !self.read_bit()? {
-                return Ok(n);
+        debug_assert!(limit <= 56);
+        let left = self.remaining();
+        let ones = (!self.peek64()).leading_zeros().min(limit);
+        if ones as usize >= left {
+            // Ran into the end: only an exact `limit` run ending there is
+            // whole; anything else wants a bit that is not there.
+            if ones == limit && left == limit as usize {
+                self.pos += left;
+                return Ok(ones);
             }
-            n += 1;
+            return Err(self.overrun(1));
         }
-        Ok(n)
+        // The run, and the `0` that ended it when it ended short of `limit`.
+        self.pos += ones as usize + usize::from(ones < limit);
+        Ok(ones)
     }
 
     /// Give back the last `n` bits read.
@@ -148,9 +253,10 @@ impl<'a> BitReader<'a> {
 #[derive(Default)]
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
-    /// Bits waiting to fill a byte, right-aligned in `acc`.
+    /// Bits waiting to be stored, right-aligned in `acc`.
     acc: u64,
-    /// How many bits of `acc` are live (always < 8 between calls).
+    /// How many bits of `acc` are live (always < 32 between calls, so a
+    /// write of up to 32 bits always fits beside them).
     live: u32,
 }
 
@@ -160,25 +266,26 @@ impl BitWriter {
     }
 
     /// Write the low `n` (≤ 64) bits of `v`.
+    #[inline]
     pub fn write(&mut self, v: u64, n: u32) {
         debug_assert!(n <= 64);
-        if n == 0 {
-            return;
-        }
-        // Split so the accumulator (≤ 7 live bits) never takes more than 56.
         if n > 32 {
             self.write(v >> 32, n - 32);
             self.write(v & 0xFFFF_FFFF, 32);
             return;
         }
+        if n == 0 {
+            return;
+        }
         let v = v & ((1u64 << n) - 1);
         self.acc = (self.acc << n) | v;
         self.live += n;
-        while self.live >= 8 {
-            self.live -= 8;
-            self.bytes.push((self.acc >> self.live) as u8);
+        if self.live >= 32 {
+            // Four whole bytes at once.
+            self.live -= 32;
+            self.bytes.extend_from_slice(&((self.acc >> self.live) as u32).to_be_bytes());
+            self.acc &= (1u64 << self.live) - 1;
         }
-        self.acc &= (1u64 << self.live) - 1;
     }
 
     pub fn write_bit(&mut self, b: bool) {
@@ -186,17 +293,32 @@ impl BitWriter {
     }
 
     /// Write `v` as an `n`-bit two's-complement field.
+    #[inline]
     pub fn write_signed(&mut self, v: i64, n: u32) {
         self.write(v as u64, n);
     }
 
     /// `n` zeros then a `1` (FLAC's unary).
+    #[inline]
     pub fn write_unary_zeros(&mut self, mut n: u32) {
         while n >= 32 {
             self.write(0, 32);
             n -= 32;
         }
         self.write(1, n + 1);
+    }
+
+    /// A FLAC Rice code: the quotient `q` in unary, then the low `k` (≤ 31)
+    /// bits of `low`; one write when the whole code fits in 32 bits.
+    #[inline]
+    pub fn write_rice(&mut self, q: u32, low: u64, k: u32) {
+        debug_assert!(k <= 31);
+        if q + 1 + k <= 32 {
+            self.write((1u64 << k) | (low & ((1u64 << k) - 1)), q + 1 + k);
+        } else {
+            self.write_unary_zeros(q);
+            self.write(low, k);
+        }
     }
 
     /// Bits written so far.
@@ -206,19 +328,25 @@ impl BitWriter {
 
     /// Pad with zeros to a byte boundary.
     pub fn align(&mut self) {
-        if self.live > 0 {
-            self.write(0, 8 - self.live);
+        if !self.live.is_multiple_of(8) {
+            self.write(0, 8 - self.live % 8);
         }
     }
 
     /// The bytes so far; only whole bytes (call [`align`](Self::align) first).
-    pub fn bytes(&self) -> &[u8] {
-        debug_assert_eq!(self.live, 0);
+    pub fn bytes(&mut self) -> &[u8] {
+        debug_assert!(self.live.is_multiple_of(8));
+        while self.live >= 8 {
+            self.live -= 8;
+            self.bytes.push((self.acc >> self.live) as u8);
+        }
+        self.acc = 0;
         &self.bytes
     }
 
     pub fn into_bytes(mut self) -> Vec<u8> {
         self.align();
+        self.bytes();
         self.bytes
     }
 }
@@ -259,6 +387,39 @@ mod tests {
         assert_eq!(r.read_unary_zeros().unwrap(), 70);
         assert_eq!(r.read_unary_ones(9).unwrap(), 3);
         assert_eq!(r.read_signed(33).unwrap(), -(1i64 << 32));
+    }
+
+    #[test]
+    fn rice_codes_read_alike_one_by_one_and_in_blocks() {
+        let mut seed = 99u32;
+        for k in [0u32, 1, 4, 13, 20, 31, 32] {
+            let mut w = BitWriter::default();
+            let mut want = Vec::new();
+            for i in 0..2000 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Mostly small quotients, some long ones that need the slow path.
+                let q = if i % 97 == 0 { u64::from(seed >> 26) + 40 } else { u64::from(seed >> 29) };
+                let low = if k == 0 { 0 } else { u64::from(seed) & ((1u64 << k) - 1) };
+                let u = (q << k) | low;
+                w.write_unary_zeros(q as u32);
+                w.write(low, k);
+                want.push((u >> 1) as i64 ^ -((u & 1) as i64));
+            }
+            let bytes = w.into_bytes();
+            let mut a = BitReader::new(&bytes, "test");
+            let mut got = vec![0i64; want.len()];
+            a.read_rice_block(k, &mut got).unwrap();
+            assert_eq!(got, want, "k {k}");
+            let mut b = BitReader::new(&bytes, "test");
+            for &v in &want {
+                let u = b.read_rice(k).unwrap();
+                assert_eq!((u >> 1) as i64 ^ -((u & 1) as i64), v);
+            }
+            assert_eq!(a.pos(), b.pos());
+            // One value more runs off the end.
+            let mut one = [0i64; 1];
+            assert!(a.read_rice_block(k, &mut one).is_err() || a.remaining() < 8);
+        }
     }
 
     #[test]

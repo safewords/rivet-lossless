@@ -82,7 +82,9 @@ pub fn parse_frame_header(data: &[u8], info: Option<&StreamInfo>) -> Result<Fram
         _ => 256 << (bs_code - 8),
     };
     let sample_rate = match sr_code {
-        0 => info.map(|i| i.sample_rate).ok_or_else(|| err("frame defers its sample rate to a STREAMINFO there is none of"))?,
+        0 => info
+            .map(|i| i.sample_rate)
+            .ok_or_else(|| err("frame defers its sample rate to a STREAMINFO there is none of"))?,
         1 => 88_200,
         2 => 176_400,
         3 => 192_000,
@@ -187,10 +189,22 @@ pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFra
         }
         _ => {}
     }
-    let mut samples = Vec::with_capacity(n * chans.len());
-    for i in 0..n {
-        for ch in &chans {
-            samples.push(ch[i] as i32);
+    let nch = chans.len();
+    let mut samples = vec![0i32; n * nch];
+    match chans.as_slice() {
+        [mono] => samples.iter_mut().zip(mono).for_each(|(d, &s)| *d = s as i32),
+        [l, r] => {
+            for ((d, &l), &r) in samples.as_chunks_mut::<2>().0.iter_mut().zip(l).zip(r) {
+                d[0] = l as i32;
+                d[1] = r as i32;
+            }
+        }
+        _ => {
+            for (c, ch) in chans.iter().enumerate() {
+                for (d, &s) in samples[c..].iter_mut().step_by(nch).zip(ch) {
+                    *d = s as i32;
+                }
+            }
         }
     }
     Ok(DecodedFrame { header, samples, len: body + 2 })
@@ -263,24 +277,22 @@ fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec
     let partition_order = br.read_u32(4)?;
     let partitions = 1usize << partition_order;
     if !n.is_multiple_of(partitions) || n >> partition_order < order {
-        return Err(err(format!(
-            "partition order {partition_order} does not fit a {n}-sample block of order {order}"
-        )));
+        return Err(err(format!("partition order {partition_order} does not fit a {n}-sample block of order {order}")));
     }
+    let mut at = out.len();
+    out.resize(n, 0);
     for p in 0..partitions {
         let count = (n >> partition_order) - if p == 0 { order } else { 0 };
         let k = br.read_u32(param_bits)?;
+        let part = &mut out[at..at + count];
+        at += count;
         if k == escape {
             let raw = br.read_u32(5)?;
-            for _ in 0..count {
-                out.push(br.read_signed(raw)?);
+            for v in part {
+                *v = br.read_signed(raw)?;
             }
         } else {
-            for _ in 0..count {
-                let q = u64::from(br.read_unary_zeros()?);
-                let u = (q << k) | br.read(k)?;
-                out.push((u >> 1) as i64 ^ -((u & 1) as i64));
-            }
+            br.read_rice_block(k, part)?;
         }
     }
     Ok(())
@@ -288,21 +300,88 @@ fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec
 
 /// The fixed predictors (§9.2.5), undone in place over the residual.
 fn restore_fixed(s: &mut [i64], order: usize) {
-    for i in order..s.len() {
-        let p = match order {
-            0 => 0,
-            1 => s[i - 1],
-            2 => 2 * s[i - 1] - s[i - 2],
-            3 => 3 * s[i - 1] - 3 * s[i - 2] + s[i - 3],
-            _ => 4 * s[i - 1] - 6 * s[i - 2] + 4 * s[i - 3] - s[i - 4],
-        };
-        s[i] += p;
+    if s.len() <= order {
+        return;
+    }
+    // Each order is a running sum of the one below it; the history lives
+    // in registers rather than being reloaded from the sample just stored.
+    match order {
+        0 => {}
+        1 => {
+            let mut a = s[0];
+            for v in &mut s[1..] {
+                a += *v;
+                *v = a;
+            }
+        }
+        2 => {
+            let (mut a, mut b) = (s[1], s[0]);
+            for v in &mut s[2..] {
+                let x = *v + 2 * a - b;
+                *v = x;
+                (a, b) = (x, a);
+            }
+        }
+        3 => {
+            let (mut a, mut b, mut c) = (s[2], s[1], s[0]);
+            for v in &mut s[3..] {
+                let x = *v + 3 * a - 3 * b + c;
+                *v = x;
+                (a, b, c) = (x, a, b);
+            }
+        }
+        _ => {
+            let (mut a, mut b, mut c, mut d) = (s[3], s[2], s[1], s[0]);
+            for v in &mut s[4..] {
+                let x = *v + 4 * a - 6 * b + 4 * c - d;
+                *v = x;
+                (a, b, c, d) = (x, a, b, c);
+            }
+        }
     }
 }
 
 /// The LPC predictor (§9.2.6), undone in place: `coefs[j]` weighs the
 /// sample `j + 1` back.
 fn restore_lpc(s: &mut [i64], coefs: &[i64], shift: u32) {
+    macro_rules! orders {
+        ($($n:literal)*) => {
+            match coefs.len() {
+                $($n => restore_lpc_n::<$n>(s, coefs, shift),)*
+                _ => restore_lpc_any(s, coefs, shift),
+            }
+        };
+    }
+    orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
+}
+
+/// [`restore_lpc`] for one order, known at compile time: the loops unroll
+/// with the coefficients in registers. The newest sample comes from a
+/// register too, and its product is added last, so the chain from one
+/// output to the next is one multiply and three adds; the older samples
+/// load from memory off that chain (wrapping sums are the same in any
+/// order).
+#[inline(always)]
+fn restore_lpc_n<const N: usize>(s: &mut [i64], coefs: &[i64], shift: u32) {
+    if s.len() <= N {
+        return;
+    }
+    let c: [i64; N] = coefs.try_into().expect("N coefficients");
+    let mut prev = s[N - 1];
+    for i in N..s.len() {
+        let win: &[i64; N] = s[i - N..i].try_into().expect("N samples");
+        let mut acc: i64 = 0;
+        for j in (1..N).rev() {
+            acc = acc.wrapping_add(c[j].wrapping_mul(win[N - 1 - j]));
+        }
+        acc = acc.wrapping_add(c[0].wrapping_mul(prev));
+        let x = s[i] + (acc >> shift);
+        s[i] = x;
+        prev = x;
+    }
+}
+
+fn restore_lpc_any(s: &mut [i64], coefs: &[i64], shift: u32) {
     let order = coefs.len();
     for i in order..s.len() {
         let mut acc: i64 = 0;
@@ -318,7 +397,7 @@ fn restore_lpc(s: &mut [i64], coefs: &[i64], shift: u32) {
 pub struct Decoder {
     info: Option<StreamInfo>,
     /// Running MD5 of the decoded audio, when STREAMINFO has one to check.
-    md5: Option<md5::Context>,
+    md5: Option<crate::md5::Md5>,
     md5_scratch: Vec<u8>,
     samples_decoded: u64,
     /// Bit depth and rate of the last frame.
@@ -338,7 +417,7 @@ impl Decoder {
             Some(e) if !e.is_empty() => Some(stream_info_from_extra(e)?),
             _ => None,
         };
-        let md5 = info.as_ref().filter(|i| i.md5 != [0; 16]).map(|_| md5::Context::new());
+        let md5 = info.as_ref().filter(|i| i.md5 != [0; 16]).map(|_| crate::md5::Md5::new());
         Ok(Self {
             bits: info.as_ref().map_or(16, |i| u32::from(i.bits_per_sample)),
             sample_rate: info.as_ref().map_or(sample_rate, |i| i.sample_rate),
@@ -415,6 +494,50 @@ impl Decoder {
         if info.total_samples == 0 || info.total_samples != self.samples_decoded {
             return None;
         }
-        Some(ctx.clone().compute().0 == info.md5)
+        Some(ctx.compute() == info.md5)
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    #[test]
+    fn specialised_restoration_matches_the_generic_loop() {
+        let mut seed = 0x1234_5678u32;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            i64::from(seed as i32)
+        };
+        for order in 1..=32usize {
+            for (bits, prec) in [(16u32, 12u32), (24, 15), (33, 15)] {
+                let coefs: Vec<i64> = (0..order).map(|_| rand() >> (32 - prec)).collect();
+                let res: Vec<i64> =
+                    (0..300).map(|i| if i < order { rand() >> (32 - bits.min(32)) } else { rand() >> 20 }).collect();
+                for shift in [0u32, 9, 15] {
+                    let mut a = res.clone();
+                    let mut b = res.clone();
+                    restore_lpc(&mut a, &coefs, shift);
+                    restore_lpc_any(&mut b, &coefs, shift);
+                    assert_eq!(a, b, "order {order} shift {shift}");
+                }
+            }
+        }
+        for order in 0..=4usize {
+            let res: Vec<i64> = (0..300).map(|_| rand() >> 18).collect();
+            let mut a = res.clone();
+            restore_fixed(&mut a, order);
+            let mut b = res.clone();
+            for i in order..b.len() {
+                b[i] += match order {
+                    0 => 0,
+                    1 => b[i - 1],
+                    2 => 2 * b[i - 1] - b[i - 2],
+                    3 => 3 * b[i - 1] - 3 * b[i - 2] + b[i - 3],
+                    _ => 4 * b[i - 1] - 6 * b[i - 2] + 4 * b[i - 3] - b[i - 4],
+                };
+            }
+            assert_eq!(a, b, "fixed order {order}");
+        }
     }
 }

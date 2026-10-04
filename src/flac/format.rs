@@ -36,11 +36,7 @@ impl StreamInfo {
 
     pub fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() < Self::LEN {
-            return Err(Error::Invalid(format!(
-                "flac: STREAMINFO is {} bytes, needs {}",
-                b.len(),
-                Self::LEN
-            )));
+            return Err(Error::Invalid(format!("flac: STREAMINFO is {} bytes, needs {}", b.len(), Self::LEN)));
         }
         let be = |r: std::ops::Range<usize>| b[r].iter().fold(0u64, |v, &x| (v << 8) | u64::from(x));
         let packed = be(10..18);
@@ -107,9 +103,7 @@ pub fn parse_metadata_blocks(b: &[u8]) -> Result<(StreamInfo, usize), Error> {
             .ok_or_else(|| Error::Invalid(format!("flac: metadata block of type {kind} runs past the data")))?;
         if info.is_none() {
             if kind != BLOCK_STREAMINFO {
-                return Err(Error::Invalid(format!(
-                    "flac: the first metadata block is type {kind}, not STREAMINFO"
-                )));
+                return Err(Error::Invalid(format!("flac: the first metadata block is type {kind}, not STREAMINFO")));
             }
             info = Some(StreamInfo::parse(body)?);
         }
@@ -141,10 +135,7 @@ pub fn stream_info_from_extra(extra: &[u8]) -> Result<StreamInfo, Error> {
     if extra.len() > 4 && extra[..4] == [0, 0, 0, 0] && looks_like_blocks(&extra[4..]) {
         return Ok(parse_metadata_blocks(&extra[4..])?.0);
     }
-    Err(Error::Invalid(format!(
-        "flac: no STREAMINFO in the {}-byte codec configuration",
-        extra.len()
-    )))
+    Err(Error::Invalid(format!("flac: no STREAMINFO in the {}-byte codec configuration", extra.len())))
 }
 
 /// CRC-8 of a frame header (§9.1.8): polynomial x^8 + x^2 + x + 1, zero
@@ -165,31 +156,66 @@ pub fn crc8(data: &[u8]) -> u8 {
     data.iter().fold(0u8, |c, &b| table[usize::from(c ^ b)])
 }
 
+/// CRC-16 tables for slicing by 16: `CRC16_TABLES[k][b]` is the CRC of the
+/// byte `b` followed by `k` zero bytes, so sixteen input bytes fold into
+/// the CRC with sixteen independent lookups instead of a chain of sixteen.
+const CRC16_TABLES: [[u16; 256]; 16] = {
+    let mut t = [[0u16; 256]; 16];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+            bit += 1;
+        }
+        t[0][i] = c;
+        i += 1;
+    }
+    let mut k = 1;
+    while k < 16 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev << 8) ^ t[0][(prev >> 8) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 /// CRC-16 of a whole frame (§9.3): polynomial x^16 + x^15 + x^2 + 1, zero
 /// initial value, no reflection.
 pub fn crc16(data: &[u8]) -> u16 {
-    static TABLE: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u16; 256];
-        for (i, e) in t.iter_mut().enumerate() {
-            let mut c = (i as u16) << 8;
-            for _ in 0..8 {
-                c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
-            }
-            *e = c;
+    let t = &CRC16_TABLES;
+    let mut c = 0u16;
+    let (chunks, rest) = data.as_chunks::<16>();
+    for b in chunks {
+        // The CRC so far lands on the first two bytes; every byte then
+        // contributes its own CRC shifted out by the bytes after it.
+        let mut x = t[15][usize::from((c >> 8) as u8 ^ b[0])] ^ t[14][usize::from(c as u8 ^ b[1])];
+        for (i, &byte) in b[2..].iter().enumerate() {
+            x ^= t[13 - i][usize::from(byte)];
         }
-        t
-    });
-    data.iter().fold(0u16, |c, &b| (c << 8) ^ table[usize::from((c >> 8) as u8 ^ b)])
+        c = x;
+    }
+    rest.iter().fold(c, |c, &b| (c << 8) ^ t[0][usize::from((c >> 8) as u8 ^ b)])
 }
 
 /// The MD5 input for interleaved samples at `bits` bits (§8.2): each sample
 /// signed little-endian in `ceil(bits / 8)` bytes.
 pub fn md5_bytes(samples: &[i32], bits: u32, out: &mut Vec<u8>) {
     let width = bits.div_ceil(8) as usize;
-    out.reserve(samples.len() * width);
-    for &s in samples {
-        out.extend_from_slice(&s.to_le_bytes()[..width]);
+    let start = out.len();
+    out.resize(start + samples.len() * width, 0);
+    let dst = &mut out[start..];
+    // One loop per width, so each compiles to plain stores.
+    match width {
+        1 => dst.iter_mut().zip(samples).for_each(|(d, &s)| *d = s as u8),
+        2 => dst.as_chunks_mut::<2>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&(s as u16).to_le_bytes())),
+        3 => dst.as_chunks_mut::<3>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes()[..3])),
+        _ => dst.as_chunks_mut::<4>().0.iter_mut().zip(samples).for_each(|(d, &s)| d.copy_from_slice(&s.to_le_bytes())),
     }
 }
 
@@ -227,5 +253,28 @@ mod tests {
         // CRC-16/UMTS (poly 0x8005, zero init, unreflected).
         assert_eq!(crc8(b"123456789"), 0xF4);
         assert_eq!(crc16(b"123456789"), 0xFEE8);
+    }
+
+    #[test]
+    fn sliced_crc16_matches_the_bitwise_definition() {
+        let bitwise = |data: &[u8]| {
+            data.iter().fold(0u16, |mut c, &b| {
+                c ^= u16::from(b) << 8;
+                for _ in 0..8 {
+                    c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+                }
+                c
+            })
+        };
+        let mut seed = 7u32;
+        let data: Vec<u8> = (0..1000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        for len in (0..64).chain([255, 256, 257, 999, 1000]) {
+            assert_eq!(crc16(&data[..len]), bitwise(&data[..len]), "{len} bytes");
+        }
     }
 }

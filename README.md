@@ -164,7 +164,7 @@ bit on every CPU and code path** — decoders trivially (lossless), encoders
 too: `the_encoded_bytes_do_not_change` holds both encoders to hashes of
 their output from before this work, on every level, depth and layout
 tested. The `force-scalar` feature compiles the run-time selection out
-(CI runs the tests both ways, on x86-64 and arm64).
+(CI runs the tests both ways, on x86-64; there is no arm64 CI).
 
 **Threads**: the encoders code the whole frames one `encode_int` call
 completes on scoped threads, one per CPU by default
